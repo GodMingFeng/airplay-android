@@ -36,7 +36,18 @@ cd airplay-android
 ./gradlew installDebug
 ```
 
-> `local.properties` 中的 `sdk.dir` 需指向本机的 Android SDK 路径。
+> `local.properties` 中的 `sdk.dir` 需指向本机的 Android SDK 路径。该文件不入版本库，首次克隆后由 Android Studio 自动生成，或手动创建。
+
+### 打正式包
+
+直接执行 `./gradlew assembleRelease` 会使用 Android 通用 debug 密钥签名，可安装但不适合正式分发。若要用自己的密钥签名，先生成 keystore：
+
+```bash
+keytool -genkeypair -v -keystore airplay-release.jks -alias airplay \
+  -keyalg RSA -keysize 2048 -validity 10000
+```
+
+再把 `keystore.properties.example` 复制为 `keystore.properties` 并填入实际密码。构建脚本检测到该文件后会自动改用它签名。keystore 与 `keystore.properties` 均已被 `.gitignore` 排除，**不要提交，也不要丢失** —— 密钥一旦丢失，已发布的应用就无法再推送升级包。
 
 ## 使用
 
