@@ -11,6 +11,20 @@
         android:layout_height="match_parent"
         android:layout_gravity="center" />
 
+    <!--
+      Idle wallpaper. It sits above the SurfaceView on purpose: a SurfaceView renders behind the
+      window and punches a transparent hole to show through, which would erase anything drawn
+      underneath it. Covering it instead works, and MainActivity hides this once frames arrive.
+      centerCrop scales the photo up until it fills the screen, keeping its aspect ratio.
+    -->
+    <ImageView
+        android:id="@+id/background"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:scaleType="centerCrop"
+        android:src="@drawable/bg_startup"
+        android:contentDescription="@null" />
+
     <LinearLayout
         android:id="@+id/controls"
         android:layout_width="match_parent"
@@ -24,7 +38,7 @@
             android:id="@+id/status_text"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="Status: Idle"
+            android:text="@string/status_idle"
             android:textColor="#FFFFFF"
             android:textSize="14sp"
             android:gravity="center" />
@@ -44,8 +58,18 @@
             android:layout_height="48dp"
             android:layout_gravity="center_horizontal"
             android:layout_marginTop="8dp"
-            android:text="Start Server"
+            android:text="@string/btn_start"
             android:textAllCaps="false" />
+
+        <TextView
+            android:id="@+id/credit_text"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/credit"
+            android:textColor="#88FFFFFF"
+            android:textSize="11sp"
+            android:gravity="center"
+            android:layout_marginTop="10dp" />
 
     </LinearLayout>
 

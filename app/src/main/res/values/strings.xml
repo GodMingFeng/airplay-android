@@ -1,15 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">AirPlay Receiver</string>
+    <string name="app_name">峰神AirPlay</string>
 
     <!-- Appended to the device's own name to build what shows up in the iPhone mirroring list -->
     <string name="airplay_name_suffix">AirPlay</string>
     <!-- Used only when the device does not expose a name of its own -->
     <string name="airplay_fallback_name">Android</string>
 
-    <string name="btn_start">Start Server</string>
-    <string name="btn_stop">Stop Server</string>
-    <string name="status_idle">Status: Idle</string>
-    <string name="status_running">Status: Running</string>
-    <string name="status_connected">Status: Connected</string>
+    <string name="btn_start">启动服务</string>
+    <string name="btn_stop">停止服务</string>
+    <string name="status_idle">状态：未启动</string>
+    <string name="status_running">状态：运行中</string>
+    <string name="status_connected">状态：已连接</string>
+
+    <!-- Signature line on the idle overlay -->
+    <string name="credit">—— 峰神出品 ——</string>
+
+    <!-- Shown in the system notification settings for this app -->
+    <string name="notification_channel_name">投屏服务</string>
+    <string name="notification_channel_desc">保持 AirPlay 接收端在后台运行</string>
 </resources>

@@ -40,6 +40,21 @@ public class VideoHolder {
         }
     }
 
+    /**
+     * Reports that the sender has torn the mirroring session down, so the UI can go back to its
+     * idle state. The decoder is deliberately left alone: it is reconfigured from the next
+     * session's SPS/PPS anyway, and tearing it down here would race with the receiving threads.
+     */
+    public static synchronized void notifySessionEnded() {
+        if (sVideoWidth == 0 && sVideoHeight == 0) return;
+        sVideoWidth = 0;
+        sVideoHeight = 0;
+        VideoSizeListener listener = sSizeListener;
+        if (listener != null) {
+            listener.onVideoSizeChanged(0, 0);
+        }
+    }
+
     public static synchronized void setSurface(Surface surface) {
         if (surface == sSurface) return; // Avoid re-initializing with same surface
         sSurface = surface;

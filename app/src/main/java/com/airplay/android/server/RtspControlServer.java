@@ -3,6 +3,7 @@ package com.airplay.android.server;
 import android.util.Log;
 
 import com.airplay.android.VideoCallbackInterface;
+import com.airplay.android.VideoHolder;
 import com.github.serezhka.jap2lib.AirPlay;
 import com.github.serezhka.jap2lib.rtsp.AudioStreamInfo;
 import com.github.serezhka.jap2lib.rtsp.MediaStreamInfo;
@@ -270,6 +271,10 @@ public class RtspControlServer {
                 MediaStreamInfo info = airPlay.rtspGetMediaStreamInfo(
                         new ByteBufInputStream(request.content()));
                 Log.i(TAG, "TEARDOWN: " + (info != null ? info.getStreamType() : "all"));
+                // A null body means the whole session goes away, otherwise only one stream does
+                if (info == null || info.getStreamType() == MediaStreamInfo.StreamType.VIDEO) {
+                    VideoHolder.notifySessionEnded();
+                }
             } catch (Exception e) {
                 Log.w(TAG, "Error in teardown", e);
             }

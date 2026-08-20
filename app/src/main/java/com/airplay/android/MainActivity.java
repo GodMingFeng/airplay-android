@@ -14,6 +14,7 @@ import android.view.View;
 import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.FrameLayout;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
@@ -33,6 +34,8 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
 
     private FrameLayout root;
     private SurfaceView surfaceView;
+    /** Wallpaper shown while nothing is being mirrored, covering the surface underneath. */
+    private ImageView background;
     private LinearLayout controls;
     private Button btnToggle;
     private TextView statusText;
@@ -61,6 +64,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
 
         root = findViewById(R.id.root);
         surfaceView = findViewById(R.id.surface_view);
+        background = findViewById(R.id.background);
         controls = findViewById(R.id.controls);
         btnToggle = findViewById(R.id.btn_toggle);
         statusText = findViewById(R.id.status_text);
@@ -72,6 +76,17 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         root.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> applyVideoAspectRatio());
 
         VideoHolder.setVideoSizeListener((width, height) -> runOnUiThread(() -> {
+            if (width == 0 || height == 0) {
+                // Session torn down: back to the wallpaper and the controls
+                videoWidth = 0;
+                videoHeight = 0;
+                background.setVisibility(View.VISIBLE);
+                controls.removeCallbacks(hideControls);
+                controls.setVisibility(View.VISIBLE);
+                statusText.setText(serverRunning ? getString(R.string.status_running)
+                        : getString(R.string.status_idle));
+                return;
+            }
             boolean firstFrame = videoWidth == 0;
             videoWidth = width;
             videoHeight = height;
@@ -79,6 +94,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
             statusText.setText(getString(R.string.status_connected) + " · " + width + "x" + height);
             if (firstFrame) {
                 // A mirroring session just began: give the whole screen to the video
+                background.setVisibility(View.GONE);
                 scheduleHideControls(0);
             }
         }));
@@ -242,6 +258,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         btnToggle.setText(R.string.btn_start);
         statusText.setText(R.string.status_idle);
         controls.setVisibility(View.VISIBLE);
+        background.setVisibility(View.VISIBLE);
     }
 
     @Override

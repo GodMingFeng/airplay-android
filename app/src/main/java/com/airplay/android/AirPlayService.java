@@ -200,8 +200,9 @@ public class AirPlayService extends Service {
 
     private void createNotificationChannel() {
         NotificationChannel channel = new NotificationChannel(
-                CHANNEL_ID, "AirPlay Service", NotificationManager.IMPORTANCE_LOW);
-        channel.setDescription("AirPlay Receiver Service");
+                CHANNEL_ID, getString(R.string.notification_channel_name),
+                NotificationManager.IMPORTANCE_LOW);
+        channel.setDescription(getString(R.string.notification_channel_desc));
         NotificationManager nm = getSystemService(NotificationManager.class);
         if (nm != null) nm.createNotificationChannel(channel);
     }
@@ -222,7 +223,7 @@ public class AirPlayService extends Service {
         PendingIntent contentIntent = PendingIntent.getActivity(this, 0, open,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         return builder
-                .setContentTitle("AirPlay Receiver")
+                .setContentTitle(getString(R.string.app_name))
                 .setContentText(text)
                 .setContentIntent(contentIntent)
                 .setSmallIcon(android.R.drawable.ic_menu_share)

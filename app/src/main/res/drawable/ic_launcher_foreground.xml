@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Foreground layer of the launcher icon. An adaptive icon is drawn on a 108dp canvas of which
+  only the middle 66dp is guaranteed to survive the launcher's mask, so the apple is pinned to
+  60dp in the centre rather than being allowed to fill the whole thing.
+
+  The artwork's own black is tinted white here: it has to read against the dark gradient behind
+  it, and tinting keeps the single source PNG usable for both.
+-->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item
+        android:width="60dp"
+        android:height="60dp"
+        android:gravity="center">
+        <bitmap
+            android:src="@drawable/ic_apple"
+            android:tint="#FFFFFF" />
+    </item>
+</layer-list>
