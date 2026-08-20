@@ -13,12 +13,17 @@ import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 
-import javax.crypto.Cipher;
-import javax.crypto.spec.IvParameterSpec;
-import javax.crypto.spec.SecretKeySpec;
-
+/**
+ * Audio receiver - follows AirPlayServer-master reference implementation:
+ * - RTP header parsing (sequence number, timestamp)
+ * - Keepalive packet filtering (16-byte magic {0x00,0x68,0x34,0x00})
+ * - AES-128-CBC decryption (per-packet, reset IV each time)
+ * - AAC-ELD decoding via MediaCodec
+ * - Simple sequence-based reorder buffer (ring buffer, 64 slots)
+ */
 public class AudioReceiver implements Runnable {
     private static final String TAG = "AudioReceiver";
+    private static final int BUFFER_SIZE = 64; // Ring buffer size (matches reference)
 
     private final AirPlay airPlay;
     private final VideoCallbackInterface callback;
@@ -30,6 +35,14 @@ public class AudioReceiver implements Runnable {
     private int port;
     private MediaCodec decoder;
     private boolean decoderStarted = false;
+
+    // Ring buffer for jitter handling (like reference C++ raop_buffer)
+    private final byte[][] pcmBuffer = new byte[BUFFER_SIZE][];
+    private final int[] seqNumbers = new int[BUFFER_SIZE];
+    private final boolean[] available = new boolean[BUFFER_SIZE];
+    private int firstSeq = -1;
+    private int lastSeq = -1;
+    private boolean bufferEmpty = true;
 
     public AudioReceiver(AirPlay airPlay, VideoCallbackInterface callback, Object monitor,
                          int sampleRate, int channels, boolean isAacEld) {
@@ -52,15 +65,10 @@ public class AudioReceiver implements Runnable {
                 monitor.notifyAll();
             }
 
-            // Initialize AAC-ELD decoder if needed
             if (isAacEld) {
                 initAacEldDecoder();
             }
 
-            byte[] shk = airPlay.getShk();
-            // Reference: AirplayServer-master-1 uses AES-128-CBC for audio (AirPlay 1 style)
-            // Key = SHA-512(aeskey + ecdh_secret)[0:16], IV = aesiv
-            // This is what airPlay.decryptAudio() does internally
             Log.i(TAG, "Audio using AES-128-CBC decryption (per AirplayServer reference)");
 
             byte[] buf = new byte[4096];
@@ -70,18 +78,26 @@ public class AudioReceiver implements Runnable {
                 socket.receive(packet);
 
                 int pktLen = packet.getLength();
+                // Filter: packets <= 12 bytes are empty keepalive
                 if (pktLen <= 12) continue;
 
                 packetCount++;
                 byte[] data = Arrays.copyOf(packet.getData(), pktLen);
 
+                // Parse RTP header
+                int seqnum = ((data[2] & 0xFF) << 8) | (data[3] & 0xFF);
+
+                // Keepalive filter: 16-byte packet with magic {0x00, 0x68, 0x34, 0x00}
+                if (pktLen == 16 && data[12] == 0x00 && data[13] == 0x68
+                        && data[14] == 0x34 && data[15] == 0x00) {
+                    continue;
+                }
+
                 try {
-                    // Reference: AirplayServer-master-1 raop_buffer.c
-                    // Strip RTP header (12 bytes), then AES-128-CBC decrypt
-                    if (pktLen <= 12) continue;
+                    // Strip RTP header (12 bytes)
                     byte[] audioPayload = Arrays.copyOfRange(data, 12, pktLen);
 
-                    // AES-128-CBC decrypt (only 16-byte aligned portion)
+                    // AES-128-CBC decrypt (per-packet, reset IV each time)
                     try {
                         airPlay.decryptAudio(audioPayload, audioPayload.length);
                     } catch (Exception e) {
@@ -90,22 +106,28 @@ public class AudioReceiver implements Runnable {
                         }
                     }
 
-                    if (audioPayload != null && audioPayload.length > 4) {
+                    if (audioPayload.length > 4) {
                         if (isAacEld && decoderStarted) {
                             if (packetCount <= 3) {
-                                Log.i(TAG, "Raw audio[" + packetCount + "] len=" + audioPayload.length +
-                                    " hex=" + bytesToHex(audioPayload, Math.min(24, audioPayload.length)));
+                                Log.i(TAG, "Packet[" + packetCount + "] seq=" + seqnum +
+                                    " len=" + audioPayload.length +
+                                    " hex=" + bytesToHex(audioPayload, Math.min(16, audioPayload.length)));
                             }
-                            decodeAndPlayAacEld(audioPayload);
+
+                            // Decode AAC-ELD to PCM
+                            byte[] pcm = decodeAacEld(audioPayload);
+                            if (pcm != null) {
+                                // Put into ring buffer and dequeue in order
+                                enqueueAndDequeue(seqnum, pcm);
+                            }
                         } else if (!isAacEld) {
-                            // PCM - send directly to AudioTrack
                             callback.onAudio(audioPayload);
                         }
                     }
 
-                    if (packetCount <= 3 || packetCount % 100 == 0) {
-                        Log.i(TAG, "Packet #" + packetCount + ": len=" + pktLen +
-                                ", decrypted=" + (audioPayload != null ? audioPayload.length : "null"));
+                    if (packetCount <= 3 || packetCount % 200 == 0) {
+                        Log.i(TAG, "Packet #" + packetCount + ": seq=" + seqnum +
+                                ", len=" + pktLen);
                     }
                 } catch (Exception e) {
                     if (packetCount <= 5) {
@@ -127,50 +149,73 @@ public class AudioReceiver implements Runnable {
     }
 
     /**
-     * ChaCha20-Poly1305 AEAD decryption
-     * RTP structure:
-     * - bytes[0:12] = RTP header (version, payload type, seq, timestamp, ssrc)
-     * - bytes[12:-24] = encrypted payload
-     * - bytes[-24:-8] = 16-byte GCM/Poly1305 tag
-     * - bytes[-8:] = 8-byte nonce
-     * AAD = bytes[4:12] (timestamp + ssrc)
+     * Ring buffer enqueue + dequeue (like reference raop_buffer_queue + raop_buffer_dequeue)
      */
-    private byte[] decryptChaCha20(byte[] data, int len, byte[] shk) throws Exception {
-        if (len < 36) return null; // minimum: 12 header + 0 payload + 16 tag + 8 nonce
+    private void enqueueAndDequeue(int seqnum, byte[] pcm) {
+        // Initialize buffer on first packet
+        if (bufferEmpty) {
+            firstSeq = seqnum;
+            lastSeq = seqnum;
+            bufferEmpty = false;
+        }
 
-        // Extract components
-        byte[] nonce = Arrays.copyOfRange(data, len - 8, len);
-        byte[] tag = Arrays.copyOfRange(data, len - 24, len - 8);
-        byte[] payload = Arrays.copyOfRange(data, 12, len - 24);
-        byte[] aad = Arrays.copyOfRange(data, 4, 12); // timestamp + ssrc
+        // Drop old packets (already played past)
+        if (seqCmp(seqnum, firstSeq) < 0) {
+            return;
+        }
 
-        if (payload.length == 0) return new byte[0];
+        // If sequence jumped too far ahead, flush and restart
+        if (seqCmp(seqnum, firstSeq + BUFFER_SIZE) >= 0) {
+            flushBuffer(seqnum);
+        }
 
-        // ChaCha20-Poly1305 needs 12-byte nonce: pad 8-byte nonce with 4 zero bytes at front
-        byte[] fullNonce = new byte[12];
-        System.arraycopy(nonce, 0, fullNonce, 4, 8);
+        // Store in ring buffer
+        int idx = seqnum % BUFFER_SIZE;
+        seqNumbers[idx] = seqnum;
+        pcmBuffer[idx] = pcm;
+        available[idx] = true;
 
-        // Combine ciphertext + tag for JCE
-        byte[] ctWithTag = new byte[payload.length + 16];
-        System.arraycopy(payload, 0, ctWithTag, 0, payload.length);
-        System.arraycopy(tag, 0, ctWithTag, payload.length, 16);
+        // Update last sequence
+        if (seqCmp(seqnum, lastSeq) > 0) {
+            lastSeq = seqnum;
+        }
 
-        Cipher cipher = Cipher.getInstance("ChaCha20-Poly1305");
-        cipher.init(Cipher.DECRYPT_MODE, new SecretKeySpec(shk, "ChaCha20"),
-                new IvParameterSpec(fullNonce));
-        cipher.updateAAD(aad);
+        // Dequeue all consecutive available frames starting from firstSeq
+        while (!bufferEmpty && seqCmp(firstSeq, lastSeq) <= 0) {
+            int fidx = firstSeq % BUFFER_SIZE;
+            if (!available[fidx]) {
+                // Gap detected - play silence and skip (like reference)
+                byte[] silence = new byte[1920]; // 480 samples * 2ch * 16bit
+                callback.onAudio(silence);
+                firstSeq++;
+                continue;
+            }
+            // Play the frame
+            callback.onAudio(pcmBuffer[fidx]);
+            available[fidx] = false;
+            pcmBuffer[fidx] = null;
+            firstSeq++;
+        }
+    }
 
-        return cipher.doFinal(ctWithTag);
+    private void flushBuffer(int nextSeq) {
+        for (int i = 0; i < BUFFER_SIZE; i++) {
+            available[i] = false;
+            pcmBuffer[i] = null;
+        }
+        firstSeq = nextSeq;
+        lastSeq = nextSeq - 1;
+        bufferEmpty = true;
     }
 
     /**
-     * Fallback AES-CBC decryption (old RSA/ANNOUNCE mode)
+     * Sequence number comparison handling 16-bit wraparound
      */
-    private byte[] decryptAesCbc(byte[] data, int len) throws Exception {
-        // Skip RTP header (12 bytes)
-        byte[] audioData = Arrays.copyOfRange(data, 12, len);
-        airPlay.decryptAudio(audioData, audioData.length);
-        return audioData;
+    private static int seqCmp(int a, int b) {
+        int diff = (a - b) & 0xFFFF;
+        if (diff > 0x8000) return -1; // a is before b (wraparound)
+        if (diff == 0) return 0;
+        return 1; // a is after b
     }
 
     /**
@@ -203,44 +248,12 @@ public class AudioReceiver implements Runnable {
         }
     }
 
-    /**
-     * Build AAC-ELD AudioSpecificConfig (ISO 14496-3)
-     */
-    private byte[] buildAacEldConfig(int sampleRate, int channels) {
-        // AAC AudioSpecificConfig for ELD:
-        // audioObjectType (5 bits): 39 (ELD) = 31 + 8 extension
-        // samplingFrequencyIndex (4 bits)
-        // channelConfiguration (4 bits)
-        // ...ELD specific config...
-        int srIdx;
-        switch (sampleRate) {
-            case 8000: srIdx = 11; break;
-            case 16000: srIdx = 8; break;
-            case 22050: srIdx = 7; break;
-            case 24000: srIdx = 6; break;
-            case 32000: srIdx = 5; break;
-            case 44100: srIdx = 4; break;
-            case 48000: srIdx = 3; break;
-            default: srIdx = 4;
-        }
-
-        // For ELD, use a simpler 2-byte config that MediaCodec often accepts
-        // audioObjectType=39 (ELD): 5 bits = 11111 (31) + extension 01000 (8) = effectively AOT 39
-        // But many Android decoders accept AOT=2 (AAC-LC) for ELD data
-        // Use AAC-LC profile with the correct sample rate as a workaround
-        int aot = 2; // AAC-LC
-        int byte0 = (aot << 3) | (srIdx >> 1);
-        int byte1 = ((srIdx & 1) << 7) | (channels << 3);
-
-        return new byte[]{(byte) byte0, (byte) byte1};
-    }
-
     private int decodedFrameCount = 0;
 
     /**
-     * Decode AAC-ELD frame and send PCM to AudioTrack
+     * Decode one AAC-ELD frame to PCM
      */
-    private void decodeAndPlayAacEld(byte[] aacData) {
+    private byte[] decodeAacEld(byte[] aacData) {
         try {
             // Queue input
             int inputIndex = decoder.dequeueInputBuffer(10000);
@@ -253,34 +266,38 @@ public class AudioReceiver implements Runnable {
                 }
             } else {
                 Log.w(TAG, "No audio input buffer available");
+                return null;
             }
 
             // Drain output
             MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
             int outputIndex;
             do {
-                outputIndex = decoder.dequeueOutputBuffer(bufferInfo, 0);
+                outputIndex = decoder.dequeueOutputBuffer(bufferInfo, 1000);
                 if (outputIndex >= 0) {
                     ByteBuffer outputBuffer = decoder.getOutputBuffer(outputIndex);
+                    byte[] pcm = null;
                     if (outputBuffer != null && bufferInfo.size > 0) {
-                        byte[] pcm = new byte[bufferInfo.size];
+                        pcm = new byte[bufferInfo.size];
                         outputBuffer.get(pcm);
                         decodedFrameCount++;
-                        if (decodedFrameCount <= 3 || decodedFrameCount % 100 == 0) {
-                            Log.i(TAG, "Decoded audio frame #" + decodedFrameCount + ", pcm=" + pcm.length + " bytes");
+                        if (decodedFrameCount <= 3 || decodedFrameCount % 200 == 0) {
+                            Log.i(TAG, "Decoded audio frame #" + decodedFrameCount +
+                                    ", pcm=" + pcm.length + " bytes");
                         }
-                        callback.onAudio(pcm);
                     }
                     decoder.releaseOutputBuffer(outputIndex, false);
+                    return pcm;
                 } else if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                     Log.i(TAG, "Audio output format changed: " + decoder.getOutputFormat());
                 } else if (outputIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
-                    // No output available yet - normal for first few frames
+                    // No output available yet
                 }
             } while (outputIndex >= 0);
         } catch (Exception e) {
             Log.e(TAG, "Error decoding AAC-ELD", e);
         }
+        return null;
     }
 
     public int getPort() {
