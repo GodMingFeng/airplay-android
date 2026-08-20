@@ -89,11 +89,11 @@ public class MirroringReceiver implements Runnable {
                 } else if (payloadType == 1) {
                     // SPS/PPS
                     processSPSPPS(payload);
-                } else if (payloadType == 5) {
-                    // Audio data in mirroring stream
-                    processAudio(payload);
                 } else {
-                    Log.i(TAG, "Unknown payload type: " + payloadType + ", size: " + payloadSize);
+                    // Ignore other payload types (including type=5 which is plist metadata, not audio)
+                    if (payloadType != 5) {
+                        Log.i(TAG, "Unknown payload type: " + payloadType + ", size: " + payloadSize);
+                    }
                 }
             }
         } catch (Exception e) {
@@ -178,18 +178,6 @@ public class MirroringReceiver implements Runnable {
         callback.onSpsPps(this.spsPps);
     }
 
-    private int audioPacketCount = 0;
-
-    private void processAudio(byte[] payload) {
-        audioPacketCount++;
-        if (audioPacketCount <= 5 || audioPacketCount % 100 == 0) {
-            Log.i(TAG, "Audio packet #" + audioPacketCount + ", size=" + payload.length +
-                    ", first8=" + bytesToHex(payload, Math.min(8, payload.length)));
-        }
-
-        // Pass to audio callback - the data is likely AAC-ELD encoded
-        callback.onAudio(payload);
-    }
 
     private static String bytesToHex(byte[] data, int len) {
         StringBuilder sb = new StringBuilder();

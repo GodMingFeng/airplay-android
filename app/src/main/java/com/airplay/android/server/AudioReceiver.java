@@ -94,7 +94,7 @@ public class AudioReceiver implements Runnable {
                         if (isAacEld && decoderStarted) {
                             if (packetCount <= 3) {
                                 Log.i(TAG, "Raw audio[" + packetCount + "] len=" + audioPayload.length +
-                                    " hex=" + bytesToHex(audioPayload, Math.min(16, audioPayload.length)));
+                                    " hex=" + bytesToHex(audioPayload, Math.min(24, audioPayload.length)));
                             }
                             decodeAndPlayAacEld(audioPayload);
                         } else if (!isAacEld) {
