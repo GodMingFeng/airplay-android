@@ -11,10 +11,16 @@ import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.IBinder;
 import android.os.PowerManager;
+import android.provider.Settings;
+import android.text.TextUtils;
 import android.util.Log;
 
 import com.airplay.android.server.AirPlayServer;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.Arrays;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -54,26 +60,74 @@ public class AirPlayService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        startForeground(NOTIFICATION_ID, buildNotification(
-                getString(R.string.airplay_device_name) + " · starting"));
+        String serverName = resolveServiceName(this);
+        String deviceId = resolveDeviceId(this);
+        startForeground(NOTIFICATION_ID, buildNotification(serverName + " · starting"));
 
         acquireLocks();
-        String serverName = getString(R.string.airplay_device_name);
-        LIFECYCLE.submit(() -> startServer(serverName));
+        LIFECYCLE.submit(() -> startServer(serverName, deviceId));
         return START_NOT_STICKY;
     }
 
+    /**
+     * Builds the name broadcast over mDNS from the device's own name, so two receivers on the
+     * same network stay apart. A fixed name made jmDNS fall back to "name (2)" as soon as the
+     * app ran on a second device.
+     *
+     * <p>{@code global device_name} is what the user typed in Settings; Android TV boxes that
+     * leave it empty usually still carry the Bluetooth name, and the model is the last resort.
+     */
+    static String resolveServiceName(Context context) {
+        String deviceName = Settings.Global.getString(
+                context.getContentResolver(), Settings.Global.DEVICE_NAME);
+        if (TextUtils.isEmpty(deviceName)) {
+            deviceName = Settings.Secure.getString(context.getContentResolver(), "bluetooth_name");
+        }
+        if (TextUtils.isEmpty(deviceName)) {
+            deviceName = Build.MODEL;
+        }
+        if (TextUtils.isEmpty(deviceName)) {
+            deviceName = context.getString(R.string.airplay_fallback_name);
+        }
+        return deviceName.trim() + " " + context.getString(R.string.airplay_name_suffix);
+    }
+
+    /**
+     * A stand-in MAC address, derived so it stays the same across restarts but differs between
+     * installs. iOS pairs the {@code _airplay} and {@code _raop} records of one receiver by this
+     * id, so the value that used to be hardcoded made two devices look like a single one.
+     */
+    private static String resolveDeviceId(Context context) {
+        String androidId = Settings.Secure.getString(
+                context.getContentResolver(), Settings.Secure.ANDROID_ID);
+        String seed = TextUtils.isEmpty(androidId) ? Build.FINGERPRINT : androidId;
+        byte[] digest;
+        try {
+            digest = MessageDigest.getInstance("SHA-256").digest(seed.getBytes(StandardCharsets.UTF_8));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 is guaranteed to be present", e);
+        }
+        byte[] mac = Arrays.copyOf(digest, 6);
+        // Mark it locally administered and unicast, the shape a made-up MAC is meant to have
+        mac[0] = (byte) ((mac[0] & 0xFE) | 0x02);
+        StringBuilder hex = new StringBuilder(12);
+        for (byte b : mac) {
+            hex.append(String.format("%02X", b));
+        }
+        return hex.toString();
+    }
+
     /** Runs on {@link #LIFECYCLE}. */
-    private void startServer(String serverName) {
+    private void startServer(String serverName, String deviceId) {
         if (sServer != null) {
             Log.i(TAG, "Server already running, ignoring duplicate start");
             return;
         }
         try {
-            AirPlayServer server = new AirPlayServer(serverName, 7000, 5000, new VideoCallback());
+            AirPlayServer server = new AirPlayServer(serverName, deviceId, 7000, 5000, new VideoCallback());
             server.start();
             sServer = server;
-            Log.i(TAG, "AirPlay server started as '" + serverName + "'");
+            Log.i(TAG, "AirPlay server started as '" + serverName + "' (id " + deviceId + ")");
             updateNotification(serverName + " · ready");
         } catch (Exception e) {
             Log.e(TAG, "Failed to start AirPlay server", e);

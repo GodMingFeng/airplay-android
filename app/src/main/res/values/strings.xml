@@ -2,8 +2,10 @@
 <resources>
     <string name="app_name">AirPlay Receiver</string>
 
-    <!-- Name advertised over mDNS, this is what shows up in the iPhone screen mirroring list -->
-    <string name="airplay_device_name">jmfat-airplay</string>
+    <!-- Appended to the device's own name to build what shows up in the iPhone mirroring list -->
+    <string name="airplay_name_suffix">AirPlay</string>
+    <!-- Used only when the device does not expose a name of its own -->
+    <string name="airplay_fallback_name">Android</string>
 
     <string name="btn_start">Start Server</string>
     <string name="btn_stop">Stop Server</string>

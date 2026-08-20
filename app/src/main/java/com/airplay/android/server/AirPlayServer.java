@@ -14,12 +14,12 @@ public class AirPlayServer {
     private final int airPlayPort;
     private final int airTunesPort;
 
-    public AirPlayServer(String serverName, int airPlayPort, int airTunesPort,
+    public AirPlayServer(String serverName, String deviceId, int airPlayPort, int airTunesPort,
                          VideoCallbackInterface callback) {
         this.serverName = serverName;
         this.airPlayPort = airPlayPort;
         this.airTunesPort = airTunesPort;
-        this.airPlayBonjour = new AirPlayBonjour(serverName);
+        this.airPlayBonjour = new AirPlayBonjour(serverName, deviceId);
         this.controlServer = new RtspControlServer(airPlayPort, airTunesPort, callback);
     }
 

@@ -117,7 +117,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     }
 
     private void displayIpAddress() {
-        String name = getString(R.string.airplay_device_name);
+        String name = AirPlayService.resolveServiceName(this);
         try {
             String ip = getLocalIpAddress();
             ipText.setText(name + "  ·  " + (ip != null ? ip : "no network"));
