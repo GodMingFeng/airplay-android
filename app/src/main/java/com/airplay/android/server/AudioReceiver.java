@@ -58,11 +58,10 @@ public class AudioReceiver implements Runnable {
             }
 
             byte[] shk = airPlay.getShk();
-            if (shk != null) {
-                Log.i(TAG, "Using ChaCha20-Poly1305 decryption, key length: " + shk.length);
-            } else {
-                Log.w(TAG, "No shk available, audio decryption may fail");
-            }
+            // Reference: AirplayServer-master-1 uses AES-128-CBC for audio (AirPlay 1 style)
+            // Key = SHA-512(aeskey + ecdh_secret)[0:16], IV = aesiv
+            // This is what airPlay.decryptAudio() does internally
+            Log.i(TAG, "Audio using AES-128-CBC decryption (per AirplayServer reference)");
 
             byte[] buf = new byte[4096];
             int packetCount = 0;
@@ -77,19 +76,28 @@ public class AudioReceiver implements Runnable {
                 byte[] data = Arrays.copyOf(packet.getData(), pktLen);
 
                 try {
-                    byte[] audioPayload;
-                    if (shk != null && shk.length == 32) {
-                        // ChaCha20-Poly1305 decryption (AP2 mode)
-                        audioPayload = decryptChaCha20(data, pktLen, shk);
-                    } else {
-                        // Fallback: try old AES-CBC method
-                        audioPayload = decryptAesCbc(data, pktLen);
+                    // Reference: AirplayServer-master-1 raop_buffer.c
+                    // Strip RTP header (12 bytes), then AES-128-CBC decrypt
+                    if (pktLen <= 12) continue;
+                    byte[] audioPayload = Arrays.copyOfRange(data, 12, pktLen);
+
+                    // AES-128-CBC decrypt (only 16-byte aligned portion)
+                    try {
+                        airPlay.decryptAudio(audioPayload, audioPayload.length);
+                    } catch (Exception e) {
+                        if (packetCount <= 3) {
+                            Log.w(TAG, "Audio decrypt error: " + e.getMessage());
+                        }
                     }
 
-                    if (audioPayload != null && audioPayload.length > 0) {
+                    if (audioPayload != null && audioPayload.length > 4) {
                         if (isAacEld && decoderStarted) {
+                            if (packetCount <= 3) {
+                                Log.i(TAG, "Raw audio[" + packetCount + "] len=" + audioPayload.length +
+                                    " hex=" + bytesToHex(audioPayload, Math.min(16, audioPayload.length)));
+                            }
                             decodeAndPlayAacEld(audioPayload);
-                        } else {
+                        } else if (!isAacEld) {
                             // PCM - send directly to AudioTrack
                             callback.onAudio(audioPayload);
                         }
@@ -170,17 +178,21 @@ public class AudioReceiver implements Runnable {
      */
     private void initAacEldDecoder() {
         try {
-            MediaFormat format = MediaFormat.createAudioFormat(
-                    MediaFormat.MIMETYPE_AUDIO_AAC, sampleRate, channels);
+            decoder = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_AUDIO_AAC);
+
+            MediaFormat format = new MediaFormat();
+            format.setString(MediaFormat.KEY_MIME, MediaFormat.MIMETYPE_AUDIO_AAC);
+            format.setInteger(MediaFormat.KEY_SAMPLE_RATE, sampleRate);
+            format.setInteger(MediaFormat.KEY_CHANNEL_COUNT, channels);
             format.setInteger(MediaFormat.KEY_AAC_PROFILE,
                     android.media.MediaCodecInfo.CodecProfileLevel.AACObjectELD);
+            format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 2048);
 
-            // Construct AAC-ELD AudioSpecificConfig
-            // For 44100Hz stereo ELD: specific bytes
-            byte[] csd = buildAacEldConfig(sampleRate, channels);
+            // Reference: AirplayServer-master-1 raop_buffer.c
+            // AAC-ELD CSD: {0xF8, 0xE8, 0x50, 0x00}
+            byte[] csd = new byte[]{(byte)0xF8, (byte)0xE8, (byte)0x50, (byte)0x00};
             format.setByteBuffer("csd-0", ByteBuffer.wrap(csd));
 
-            decoder = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_AUDIO_AAC);
             decoder.configure(format, null, null, 0);
             decoder.start();
             decoderStarted = true;
@@ -223,6 +235,8 @@ public class AudioReceiver implements Runnable {
         return new byte[]{(byte) byte0, (byte) byte1};
     }
 
+    private int decodedFrameCount = 0;
+
     /**
      * Decode AAC-ELD frame and send PCM to AudioTrack
      */
@@ -237,6 +251,8 @@ public class AudioReceiver implements Runnable {
                     inputBuffer.put(aacData);
                     decoder.queueInputBuffer(inputIndex, 0, aacData.length, 0, 0);
                 }
+            } else {
+                Log.w(TAG, "No audio input buffer available");
             }
 
             // Drain output
@@ -249,9 +265,17 @@ public class AudioReceiver implements Runnable {
                     if (outputBuffer != null && bufferInfo.size > 0) {
                         byte[] pcm = new byte[bufferInfo.size];
                         outputBuffer.get(pcm);
+                        decodedFrameCount++;
+                        if (decodedFrameCount <= 3 || decodedFrameCount % 100 == 0) {
+                            Log.i(TAG, "Decoded audio frame #" + decodedFrameCount + ", pcm=" + pcm.length + " bytes");
+                        }
                         callback.onAudio(pcm);
                     }
                     decoder.releaseOutputBuffer(outputIndex, false);
+                } else if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    Log.i(TAG, "Audio output format changed: " + decoder.getOutputFormat());
+                } else if (outputIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
+                    // No output available yet - normal for first few frames
                 }
             } while (outputIndex >= 0);
         } catch (Exception e) {
@@ -261,5 +285,13 @@ public class AudioReceiver implements Runnable {
 
     public int getPort() {
         return port;
+    }
+
+    private static String bytesToHex(byte[] data, int len) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < len; i++) {
+            sb.append(String.format("%02x", data[i] & 0xFF));
+        }
+        return sb.toString();
     }
 }

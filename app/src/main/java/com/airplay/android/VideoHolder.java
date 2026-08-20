@@ -142,79 +142,10 @@ public class VideoHolder {
         }
     }
 
-    private static MediaCodec sAudioDecoder;
-    private static boolean sAudioDecoderStarted = false;
-    private static int sAudioPacketCount = 0;
-
     public static void onAudioData(byte[] audio) {
-        sAudioPacketCount++;
-        if (!sAudioDecoderStarted) {
-            initAudioDecoder();
+        if (sAudioPlayer == null) {
+            sAudioPlayer = new AudioPlayer();
         }
-
-        if (sAudioDecoder != null && sAudioDecoderStarted) {
-            decodeAndPlayAudio(audio);
-        }
-    }
-
-    private static void initAudioDecoder() {
-        try {
-            MediaFormat format = MediaFormat.createAudioFormat(
-                    MediaFormat.MIMETYPE_AUDIO_AAC, 44100, 2);
-            format.setInteger(MediaFormat.KEY_AAC_PROFILE,
-                    android.media.MediaCodecInfo.CodecProfileLevel.AACObjectELD);
-            // Build AAC-ELD AudioSpecificConfig for 44100Hz stereo
-            // AOT=39 (ELD) but we use AOT=2 (AAC-LC) as many Android decoders accept this
-            // srIdx=4 (44100), chConfig=2
-            byte[] csd = new byte[]{(byte) 0x12, (byte) 0x10}; // AAC-LC 44100Hz stereo
-            format.setByteBuffer("csd-0", ByteBuffer.wrap(csd));
-
-            sAudioDecoder = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_AUDIO_AAC);
-            sAudioDecoder.configure(format, null, null, 0);
-            sAudioDecoder.start();
-            sAudioDecoderStarted = true;
-            android.util.Log.i(TAG, "Audio AAC-ELD decoder initialized");
-        } catch (Exception e) {
-            android.util.Log.e(TAG, "Failed to init audio decoder", e);
-            sAudioDecoderStarted = false;
-        }
-    }
-
-    private static void decodeAndPlayAudio(byte[] aacData) {
-        try {
-            // Queue input
-            int inputIndex = sAudioDecoder.dequeueInputBuffer(10000);
-            if (inputIndex >= 0) {
-                ByteBuffer inputBuffer = sAudioDecoder.getInputBuffer(inputIndex);
-                if (inputBuffer != null) {
-                    inputBuffer.clear();
-                    inputBuffer.put(aacData);
-                    sAudioDecoder.queueInputBuffer(inputIndex, 0, aacData.length, 0, 0);
-                }
-            }
-
-            // Drain output
-            MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
-            int outputIndex;
-            do {
-                outputIndex = sAudioDecoder.dequeueOutputBuffer(bufferInfo, 0);
-                if (outputIndex >= 0) {
-                    ByteBuffer outputBuffer = sAudioDecoder.getOutputBuffer(outputIndex);
-                    if (outputBuffer != null && bufferInfo.size > 0) {
-                        byte[] pcm = new byte[bufferInfo.size];
-                        outputBuffer.get(pcm);
-                        if (sAudioPlayer == null) {
-                            sAudioPlayer = new AudioPlayer();
-                        }
-                        sAudioPlayer.play(pcm);
-                    }
-                    sAudioDecoder.releaseOutputBuffer(outputIndex, false);
-                } else if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED && sAudioPacketCount <= 3) {
-                    android.util.Log.i(TAG, "Audio output format: " + sAudioDecoder.getOutputFormat());
-                }
-            } while (outputIndex >= 0);
-        } catch (Exception e) {
-            android.util.Log.e(TAG, "Error decoding audio packet #" + sAudioPacketCount, e);
-        }
+        sAudioPlayer.play(audio);
     }
 }

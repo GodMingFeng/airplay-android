@@ -10,7 +10,6 @@ class FairPlayAudioDecryptor {
 
     private final byte[] aesIV;
     private final byte[] eaesKey;
-
     private final Cipher aesCbcDecrypt;
 
     FairPlayAudioDecryptor(byte[] aesKey, byte[] aesIV, byte[] sharedSecret) throws Exception {
@@ -25,11 +24,8 @@ class FairPlayAudioDecryptor {
     }
 
     void decrypt(byte[] audio, int audioLength) throws Exception {
-        initAesCbcCipher();
-        aesCbcDecrypt.update(audio, 0, audioLength / 16 * 16, audio, 0);
-    }
-
-    private void initAesCbcCipher() throws Exception {
+        // Reference C++ creates new context per packet - reset cipher each time
         aesCbcDecrypt.init(Cipher.DECRYPT_MODE, new SecretKeySpec(eaesKey, "AES"), new IvParameterSpec(aesIV));
+        aesCbcDecrypt.update(audio, 0, audioLength / 16 * 16, audio, 0);
     }
 }
