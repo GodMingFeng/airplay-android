@@ -17,6 +17,9 @@ android {
     buildTypes {
         release {
             minifyEnabled false
+            // Signed with the shared debug key so the release APK is directly installable.
+            // Swap in a private keystore before publishing anything that needs upgrades.
+            signingConfig signingConfigs.debug
         }
         debug {
             minifyEnabled false
