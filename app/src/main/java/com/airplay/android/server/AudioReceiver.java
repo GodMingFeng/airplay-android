@@ -12,18 +12,21 @@ import java.net.DatagramSocket;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.TimeUnit;
 
 /**
- * Audio receiver - follows AirPlayServer-master reference implementation:
- * - RTP header parsing (sequence number, timestamp)
- * - Keepalive packet filtering (16-byte magic {0x00,0x68,0x34,0x00})
- * - AES-128-CBC decryption (per-packet, reset IV each time)
- * - AAC-ELD decoding via MediaCodec
- * - Simple sequence-based reorder buffer (ring buffer, 64 slots)
+ * Audio receiver following AirPlayServer-master reference:
+ * - RTP receive + decrypt + AAC decode on receiver thread
+ * - PCM pushed to queue, AudioTrack drains from queue on separate thread
+ * - Ring buffer for sequence-based reorder (64 slots)
+ * - no_resend=1: immediate playback, no waiting for retransmits
+ * - Keepalive filtering: 16-byte magic {0x00,0x68,0x34,0x00}
  */
 public class AudioReceiver implements Runnable {
     private static final String TAG = "AudioReceiver";
-    private static final int BUFFER_SIZE = 64; // Ring buffer size (matches reference)
+    private static final int BUFFER_SIZE = 64;
+    private static final int QUEUE_MAX_FRAMES = 20; // Reference: AUDIO_QUEUE_MAX_FRAMES
 
     private final AirPlay airPlay;
     private final VideoCallbackInterface callback;
@@ -36,10 +39,13 @@ public class AudioReceiver implements Runnable {
     private MediaCodec decoder;
     private boolean decoderStarted = false;
 
-    // Ring buffer for jitter handling (like reference C++ raop_buffer)
+    // PCM playback queue (decouples receive/decode from playback)
+    private final ArrayBlockingQueue<byte[]> pcmQueue = new ArrayBlockingQueue<>(QUEUE_MAX_FRAMES);
+
+    // Ring buffer for reorder (like reference raop_buffer)
     private final byte[][] pcmBuffer = new byte[BUFFER_SIZE][];
     private final int[] seqNumbers = new int[BUFFER_SIZE];
-    private final boolean[] available = new boolean[BUFFER_SIZE];
+    private final boolean[] slotAvailable = new boolean[BUFFER_SIZE];
     private int firstSeq = -1;
     private int lastSeq = -1;
     private boolean bufferEmpty = true;
@@ -69,7 +75,12 @@ public class AudioReceiver implements Runnable {
                 initAacEldDecoder();
             }
 
-            Log.i(TAG, "Audio using AES-128-CBC decryption (per AirplayServer reference)");
+            // Start playback thread (drains pcmQueue → AudioTrack)
+            Thread playbackThread = new Thread(this::playbackLoop, "AudioPlayback");
+            playbackThread.setDaemon(true);
+            playbackThread.start();
+
+            Log.i(TAG, "Audio using AES-128-CBC (per AirplayServer reference)");
 
             byte[] buf = new byte[4096];
             int packetCount = 0;
@@ -78,93 +89,108 @@ public class AudioReceiver implements Runnable {
                 socket.receive(packet);
 
                 int pktLen = packet.getLength();
-                // Filter: packets <= 12 bytes are empty keepalive
                 if (pktLen <= 12) continue;
 
                 packetCount++;
                 byte[] data = Arrays.copyOf(packet.getData(), pktLen);
 
-                // Parse RTP header
+                // Parse RTP sequence number
                 int seqnum = ((data[2] & 0xFF) << 8) | (data[3] & 0xFF);
 
-                // Keepalive filter: 16-byte packet with magic {0x00, 0x68, 0x34, 0x00}
+                // Keepalive filter (reference: raop_buffer.c)
                 if (pktLen == 16 && data[12] == 0x00 && data[13] == 0x68
                         && data[14] == 0x34 && data[15] == 0x00) {
                     continue;
                 }
 
                 try {
-                    // Strip RTP header (12 bytes)
+                    // Strip RTP header
                     byte[] audioPayload = Arrays.copyOfRange(data, 12, pktLen);
 
-                    // AES-128-CBC decrypt (per-packet, reset IV each time)
+                    // AES-128-CBC decrypt (per-packet reset)
                     try {
                         airPlay.decryptAudio(audioPayload, audioPayload.length);
                     } catch (Exception e) {
+                        if (packetCount <= 3) Log.w(TAG, "Decrypt error: " + e.getMessage());
+                    }
+
+                    if (audioPayload.length > 4 && isAacEld && decoderStarted) {
                         if (packetCount <= 3) {
-                            Log.w(TAG, "Audio decrypt error: " + e.getMessage());
+                            Log.i(TAG, "Pkt[" + packetCount + "] seq=" + seqnum +
+                                " len=" + audioPayload.length +
+                                " hex=" + bytesToHex(audioPayload, Math.min(16, audioPayload.length)));
                         }
+
+                        // Decode AAC-ELD → PCM
+                        byte[] pcm = decodeAacEld(audioPayload);
+                        if (pcm != null) {
+                            // Enqueue to ring buffer, dequeue in order to pcmQueue
+                            enqueueAndDequeue(seqnum, pcm);
+                        }
+                    } else if (!isAacEld && audioPayload.length > 4) {
+                        pushToPlaybackQueue(audioPayload);
                     }
 
-                    if (audioPayload.length > 4) {
-                        if (isAacEld && decoderStarted) {
-                            if (packetCount <= 3) {
-                                Log.i(TAG, "Packet[" + packetCount + "] seq=" + seqnum +
-                                    " len=" + audioPayload.length +
-                                    " hex=" + bytesToHex(audioPayload, Math.min(16, audioPayload.length)));
-                            }
-
-                            // Decode AAC-ELD to PCM
-                            byte[] pcm = decodeAacEld(audioPayload);
-                            if (pcm != null) {
-                                // Put into ring buffer and dequeue in order
-                                enqueueAndDequeue(seqnum, pcm);
-                            }
-                        } else if (!isAacEld) {
-                            callback.onAudio(audioPayload);
-                        }
-                    }
-
-                    if (packetCount <= 3 || packetCount % 200 == 0) {
+                    if (packetCount <= 3 || packetCount % 500 == 0) {
                         Log.i(TAG, "Packet #" + packetCount + ": seq=" + seqnum +
-                                ", len=" + pktLen);
+                                ", len=" + pktLen + ", qSize=" + pcmQueue.size());
                     }
                 } catch (Exception e) {
-                    if (packetCount <= 5) {
-                        Log.e(TAG, "Error processing audio packet #" + packetCount, e);
-                    }
+                    if (packetCount <= 5) Log.e(TAG, "Error packet #" + packetCount, e);
                 }
             }
         } catch (Exception e) {
-            if (!Thread.currentThread().isInterrupted()) {
-                Log.e(TAG, "Audio receiver error", e);
-            }
+            if (!Thread.currentThread().isInterrupted()) Log.e(TAG, "Audio receiver error", e);
         } finally {
-            if (decoder != null) {
-                decoder.stop();
-                decoder.release();
-            }
+            if (decoder != null) { decoder.stop(); decoder.release(); }
             if (socket != null) socket.close();
         }
     }
 
     /**
-     * Ring buffer enqueue + dequeue (like reference raop_buffer_queue + raop_buffer_dequeue)
+     * Playback thread: drains pcmQueue and writes to AudioTrack via callback
+     */
+    private void playbackLoop() {
+        Log.i(TAG, "Playback thread started");
+        while (!Thread.currentThread().isInterrupted()) {
+            try {
+                byte[] pcm = pcmQueue.poll(100, TimeUnit.MILLISECONDS);
+                if (pcm != null) {
+                    callback.onAudio(pcm);
+                }
+            } catch (InterruptedException e) {
+                break;
+            }
+        }
+        Log.i(TAG, "Playback thread stopped");
+    }
+
+    /**
+     * Push PCM to playback queue (non-blocking, drops oldest if full like reference)
+     */
+    private void pushToPlaybackQueue(byte[] pcm) {
+        if (!pcmQueue.offer(pcm)) {
+            // Queue full - drop oldest frame (like reference AUDIO_QUEUE_MAX_FRAMES limit)
+            pcmQueue.poll();
+            pcmQueue.offer(pcm);
+        }
+    }
+
+    /**
+     * Ring buffer enqueue + in-order dequeue (reference: raop_buffer.c)
+     * no_resend=1: always advance, play silence for gaps
      */
     private void enqueueAndDequeue(int seqnum, byte[] pcm) {
-        // Initialize buffer on first packet
         if (bufferEmpty) {
             firstSeq = seqnum;
             lastSeq = seqnum;
             bufferEmpty = false;
         }
 
-        // Drop old packets (already played past)
-        if (seqCmp(seqnum, firstSeq) < 0) {
-            return;
-        }
+        // Drop old packets
+        if (seqCmp(seqnum, firstSeq) < 0) return;
 
-        // If sequence jumped too far ahead, flush and restart
+        // Flush if jumped too far
         if (seqCmp(seqnum, firstSeq + BUFFER_SIZE) >= 0) {
             flushBuffer(seqnum);
         }
@@ -173,34 +199,28 @@ public class AudioReceiver implements Runnable {
         int idx = seqnum % BUFFER_SIZE;
         seqNumbers[idx] = seqnum;
         pcmBuffer[idx] = pcm;
-        available[idx] = true;
+        slotAvailable[idx] = true;
 
-        // Update last sequence
-        if (seqCmp(seqnum, lastSeq) > 0) {
-            lastSeq = seqnum;
-        }
+        if (seqCmp(seqnum, lastSeq) > 0) lastSeq = seqnum;
 
-        // Dequeue all consecutive available frames starting from firstSeq
+        // Dequeue consecutive available frames (no_resend=1: always advance)
         while (!bufferEmpty && seqCmp(firstSeq, lastSeq) <= 0) {
             int fidx = firstSeq % BUFFER_SIZE;
-            if (!available[fidx]) {
-                // Gap detected - play silence and skip (like reference)
-                byte[] silence = new byte[1920]; // 480 samples * 2ch * 16bit
-                callback.onAudio(silence);
-                firstSeq++;
-                continue;
+            if (slotAvailable[fidx]) {
+                pushToPlaybackQueue(pcmBuffer[fidx]);
+                slotAvailable[fidx] = false;
+                pcmBuffer[fidx] = null;
+            } else {
+                // Missing packet - push silence (like reference: memset(entry->audio_buffer, 0, ...))
+                pushToPlaybackQueue(new byte[1920]);
             }
-            // Play the frame
-            callback.onAudio(pcmBuffer[fidx]);
-            available[fidx] = false;
-            pcmBuffer[fidx] = null;
             firstSeq++;
         }
     }
 
     private void flushBuffer(int nextSeq) {
         for (int i = 0; i < BUFFER_SIZE; i++) {
-            available[i] = false;
+            slotAvailable[i] = false;
             pcmBuffer[i] = null;
         }
         firstSeq = nextSeq;
@@ -208,23 +228,16 @@ public class AudioReceiver implements Runnable {
         bufferEmpty = true;
     }
 
-    /**
-     * Sequence number comparison handling 16-bit wraparound
-     */
     private static int seqCmp(int a, int b) {
         int diff = (a - b) & 0xFFFF;
-        if (diff > 0x8000) return -1; // a is before b (wraparound)
+        if (diff > 0x8000) return -1;
         if (diff == 0) return 0;
-        return 1; // a is after b
+        return 1;
     }
 
-    /**
-     * Initialize AAC-ELD MediaCodec decoder
-     */
     private void initAacEldDecoder() {
         try {
             decoder = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_AUDIO_AAC);
-
             MediaFormat format = new MediaFormat();
             format.setString(MediaFormat.KEY_MIME, MediaFormat.MIMETYPE_AUDIO_AAC);
             format.setInteger(MediaFormat.KEY_SAMPLE_RATE, sampleRate);
@@ -233,15 +246,14 @@ public class AudioReceiver implements Runnable {
                     android.media.MediaCodecInfo.CodecProfileLevel.AACObjectELD);
             format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 2048);
 
-            // Reference: AirplayServer-master-1 raop_buffer.c
-            // AAC-ELD CSD: {0xF8, 0xE8, 0x50, 0x00}
+            // Reference: raop_buffer.c AAC-ELD CSD
             byte[] csd = new byte[]{(byte)0xF8, (byte)0xE8, (byte)0x50, (byte)0x00};
             format.setByteBuffer("csd-0", ByteBuffer.wrap(csd));
 
             decoder.configure(format, null, null, 0);
             decoder.start();
             decoderStarted = true;
-            Log.i(TAG, "AAC-ELD decoder initialized, sampleRate=" + sampleRate + ", channels=" + channels);
+            Log.i(TAG, "AAC-ELD decoder initialized, sr=" + sampleRate + ", ch=" + channels);
         } catch (Exception e) {
             Log.e(TAG, "Failed to init AAC-ELD decoder", e);
             decoderStarted = false;
@@ -250,12 +262,8 @@ public class AudioReceiver implements Runnable {
 
     private int decodedFrameCount = 0;
 
-    /**
-     * Decode one AAC-ELD frame to PCM
-     */
     private byte[] decodeAacEld(byte[] aacData) {
         try {
-            // Queue input
             int inputIndex = decoder.dequeueInputBuffer(10000);
             if (inputIndex >= 0) {
                 ByteBuffer inputBuffer = decoder.getInputBuffer(inputIndex);
@@ -265,11 +273,10 @@ public class AudioReceiver implements Runnable {
                     decoder.queueInputBuffer(inputIndex, 0, aacData.length, 0, 0);
                 }
             } else {
-                Log.w(TAG, "No audio input buffer available");
+                Log.w(TAG, "No input buffer available");
                 return null;
             }
 
-            // Drain output
             MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
             int outputIndex;
             do {
@@ -281,21 +288,18 @@ public class AudioReceiver implements Runnable {
                         pcm = new byte[bufferInfo.size];
                         outputBuffer.get(pcm);
                         decodedFrameCount++;
-                        if (decodedFrameCount <= 3 || decodedFrameCount % 200 == 0) {
-                            Log.i(TAG, "Decoded audio frame #" + decodedFrameCount +
-                                    ", pcm=" + pcm.length + " bytes");
+                        if (decodedFrameCount <= 3 || decodedFrameCount % 500 == 0) {
+                            Log.i(TAG, "Decoded #" + decodedFrameCount + ", pcm=" + pcm.length + "B");
                         }
                     }
                     decoder.releaseOutputBuffer(outputIndex, false);
                     return pcm;
                 } else if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                    Log.i(TAG, "Audio output format changed: " + decoder.getOutputFormat());
-                } else if (outputIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
-                    // No output available yet
+                    Log.i(TAG, "Output format: " + decoder.getOutputFormat());
                 }
             } while (outputIndex >= 0);
         } catch (Exception e) {
-            Log.e(TAG, "Error decoding AAC-ELD", e);
+            Log.e(TAG, "Decode error", e);
         }
         return null;
     }
