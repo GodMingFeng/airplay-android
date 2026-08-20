@@ -87,7 +87,8 @@ public class MirroringReceiver implements Runnable {
                         Log.e(TAG, "Error video, size: " + payload.length, e);
                     }
                 } else if (payloadType == 1) {
-                    // SPS/PPS
+                    // SPS/PPS packet: its 128 byte header also carries the source screen size
+                    processVideoSize(header);
                     processSPSPPS(payload);
                 } else {
                     // Ignore other payload types (including type=5 which is plist metadata, not audio)
@@ -101,6 +102,33 @@ public class MirroringReceiver implements Runnable {
                 Log.e(TAG, "Mirroring receiver error", e);
             }
         }
+    }
+
+    /**
+     * The header of a type=1 (SPS/PPS) packet carries the sender's video geometry as
+     * little-endian floats: source size at offset 40/44 and encoded size at offset 56/60.
+     */
+    private void processVideoSize(ByteBuffer header) {
+        int width = (int) header.getFloat(40);
+        int height = (int) header.getFloat(44);
+        int encodedWidth = (int) header.getFloat(56);
+        int encodedHeight = (int) header.getFloat(60);
+
+        if (!isPlausibleSize(width, height)) {
+            width = encodedWidth;
+            height = encodedHeight;
+        }
+
+        Log.i(TAG, "Video size from header: source=" + (int) header.getFloat(40) + "x" + (int) header.getFloat(44)
+                + ", encoded=" + encodedWidth + "x" + encodedHeight);
+
+        if (isPlausibleSize(width, height)) {
+            callback.onVideoFormat(width, height);
+        }
+    }
+
+    private static boolean isPlausibleSize(int width, int height) {
+        return width >= 16 && height >= 16 && width <= 8192 && height <= 8192;
     }
 
     private void processVideo(byte[] payload) {

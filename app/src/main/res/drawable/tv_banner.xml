@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Banner shown by the Android TV / Google TV launcher (leanback requires one) -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item>
+        <shape android:shape="rectangle">
+            <gradient
+                android:angle="315"
+                android:startColor="#1565C0"
+                android:endColor="#0D253F"
+                android:type="linear" />
+        </shape>
+    </item>
+</layer-list>

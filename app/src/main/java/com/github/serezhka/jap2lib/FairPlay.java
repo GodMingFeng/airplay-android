@@ -4,6 +4,7 @@ import net.i2p.crypto.eddsa.Utils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -17,7 +18,11 @@ class FairPlay {
     private final byte[] keyMsg = new byte[164];
 
     void fairPlaySetup(InputStream request, OutputStream response) throws IOException {
-        byte[] data = request.readAllBytes();
+        byte[] data = readFully(request);
+        if (data.length < 5) {
+            log.error("FairPlay setup body too short: {} bytes", data.length);
+            return;
+        }
         if (data[4] != 3) {
             log.error("FairPlay version {} is not supported!", data[4]);
             return;
@@ -39,6 +44,20 @@ class FairPlay {
 
             response.write(data, 144, 20);
         }
+    }
+
+    /**
+     * Drains the stream by hand instead of using {@code InputStream.readAllBytes()}, which only
+     * exists from API 33 onwards and throws {@link NoSuchMethodError} on older devices.
+     */
+    private static byte[] readFully(InputStream in) throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        byte[] buffer = new byte[1024];
+        int read;
+        while ((read = in.read(buffer)) != -1) {
+            out.write(buffer, 0, read);
+        }
+        return out.toByteArray();
     }
 
     byte[] decryptAesKey(byte[] key) {

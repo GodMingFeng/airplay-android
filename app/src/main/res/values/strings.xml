@@ -1,6 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">AirPlay Receiver</string>
+
+    <!-- Name advertised over mDNS, this is what shows up in the iPhone screen mirroring list -->
+    <string name="airplay_device_name">jmfat-airplay</string>
+
     <string name="btn_start">Start Server</string>
     <string name="btn_stop">Stop Server</string>
     <string name="status_idle">Status: Idle</string>
