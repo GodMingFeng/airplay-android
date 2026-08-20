@@ -2,9 +2,30 @@ plugins {
     id 'com.android.application'
 }
 
+// Release signing is driven by keystore.properties, which stays out of version control
+// along with the keystore itself. Without that file the release build falls back to the
+// debug key, so a fresh clone still produces an installable APK.
+def keystorePropertiesFile = rootProject.file('keystore.properties')
+def useReleaseKeystore = keystorePropertiesFile.exists()
+def keystoreProperties = new Properties()
+if (useReleaseKeystore) {
+    keystorePropertiesFile.withInputStream { keystoreProperties.load(it) }
+}
+
 android {
     namespace 'com.airplay.android'
     compileSdk 33
+
+    signingConfigs {
+        if (useReleaseKeystore) {
+            release {
+                storeFile rootProject.file(keystoreProperties['storeFile'])
+                storePassword keystoreProperties['storePassword']
+                keyAlias keystoreProperties['keyAlias']
+                keyPassword keystoreProperties['keyPassword']
+            }
+        }
+    }
 
     defaultConfig {
         applicationId "com.airplay.android"
@@ -17,9 +38,7 @@ android {
     buildTypes {
         release {
             minifyEnabled false
-            // Signed with the shared debug key so the release APK is directly installable.
-            // Swap in a private keystore before publishing anything that needs upgrades.
-            signingConfig signingConfigs.debug
+            signingConfig useReleaseKeystore ? signingConfigs.release : signingConfigs.debug
         }
         debug {
             minifyEnabled false
