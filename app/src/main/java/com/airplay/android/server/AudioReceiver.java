@@ -27,6 +27,14 @@ public class AudioReceiver implements Runnable {
     private static final String TAG = "AudioReceiver";
     private static final int BUFFER_SIZE = 64;
     private static final int QUEUE_MAX_FRAMES = 20; // Reference: AUDIO_QUEUE_MAX_FRAMES
+    /** AAC-ELD packet length used by AirPlay mirroring, in samples per channel. */
+    private static final int SAMPLES_PER_PACKET = 480;
+    /** Same thing in bytes of stereo 16 bit PCM. */
+    private static final int SILENCE_BYTES = SAMPLES_PER_PACKET * 2 * 2;
+    /** RTP payload type of an audio packet. */
+    private static final int TYPE_AUDIO = 0x60;
+    /** A retransmitted packet, which arrives with the original one wrapped behind a four byte head. */
+    private static final int TYPE_RESEND = 0x56;
 
     private final AirPlay airPlay;
     private final VideoCallbackInterface callback;
@@ -40,15 +48,31 @@ public class AudioReceiver implements Runnable {
     private boolean decoderStarted = false;
 
     // PCM playback queue (decouples receive/decode from playback)
-    private final ArrayBlockingQueue<byte[]> pcmQueue = new ArrayBlockingQueue<>(QUEUE_MAX_FRAMES);
+    private final ArrayBlockingQueue<PcmFrame> pcmQueue = new ArrayBlockingQueue<>(QUEUE_MAX_FRAMES);
 
     // Ring buffer for reorder (like reference raop_buffer)
-    private final byte[][] pcmBuffer = new byte[BUFFER_SIZE][];
+    private final PcmFrame[] pcmBuffer = new PcmFrame[BUFFER_SIZE];
     private final int[] seqNumbers = new int[BUFFER_SIZE];
     private final boolean[] slotAvailable = new boolean[BUFFER_SIZE];
     private int firstSeq = -1;
     private int lastSeq = -1;
     private boolean bufferEmpty = true;
+    /** Timestamp of the last sample handed to playback, used to stamp inserted silence. */
+    private long lastPushedRtp;
+    /** Packets turned away before the decoder, counted only so the log can say how many. */
+    private int duplicateCount;
+    private int otherTypeCount;
+
+    /** Decoded samples together with the sender's RTP timestamp of the packet they came from. */
+    private static final class PcmFrame {
+        final byte[] pcm;
+        final long rtpTime;
+
+        PcmFrame(byte[] pcm, long rtpTime) {
+            this.pcm = pcm;
+            this.rtpTime = rtpTime;
+        }
+    }
 
     public AudioReceiver(AirPlay airPlay, VideoCallbackInterface callback, Object monitor,
                          int sampleRate, int channels, boolean isAacEld) {
@@ -94,18 +118,50 @@ public class AudioReceiver implements Runnable {
                 packetCount++;
                 byte[] data = Arrays.copyOf(packet.getData(), pktLen);
 
-                // Parse RTP sequence number
-                int seqnum = ((data[2] & 0xFF) << 8) | (data[3] & 0xFF);
+                // Everything on this port gets decrypted and handed to the AAC decoder, so what
+                // is not audio has to be turned away here: a stray packet decrypts to noise and
+                // the decoder carries that noise into the frames around it.
+                int payloadType = data[1] & 0x7F;
+                int rtp = 0;
+                if (payloadType == TYPE_RESEND) {
+                    rtp = 4; // the original packet begins after the resend header
+                } else if (payloadType != TYPE_AUDIO) {
+                    otherTypeCount++;
+                    if (otherTypeCount <= 3 || otherTypeCount % 500 == 0) {
+                        Log.i(TAG, "Ignored " + otherTypeCount + " packets that are not audio,"
+                                + " last type=" + payloadType + ", len=" + pktLen);
+                    }
+                    continue;
+                }
+                if (pktLen <= rtp + 12) continue;
+
+                // Parse RTP sequence number and the 44100Hz timestamp the sender stamped the
+                // packet with, which is what lines the sound up with the picture later on
+                int seqnum = ((data[rtp + 2] & 0xFF) << 8) | (data[rtp + 3] & 0xFF);
+                long rtpTime = ((data[rtp + 4] & 0xFFL) << 24) | ((data[rtp + 5] & 0xFFL) << 16)
+                        | ((data[rtp + 6] & 0xFFL) << 8) | (data[rtp + 7] & 0xFFL);
 
                 // Keepalive filter (reference: raop_buffer.c)
-                if (pktLen == 16 && data[12] == 0x00 && data[13] == 0x68
-                        && data[14] == 0x34 && data[15] == 0x00) {
+                if (pktLen == rtp + 16 && data[rtp + 12] == 0x00 && data[rtp + 13] == 0x68
+                        && data[rtp + 14] == 0x34 && data[rtp + 15] == 0x00) {
+                    continue;
+                }
+
+                // AAC-ELD carries state from one frame into the next, so decoding a packet twice
+                // does not merely waste the work: it corrupts the frames on either side of it.
+                // The ring buffer below would discard the copy, but only after the damage is done.
+                if (alreadySeen(seqnum)) {
+                    duplicateCount++;
+                    if (duplicateCount % 500 == 0) {
+                        Log.i(TAG, "Skipped " + duplicateCount + " duplicates of " + packetCount
+                                + " packets, last seq=" + seqnum + ", type=" + payloadType);
+                    }
                     continue;
                 }
 
                 try {
                     // Strip RTP header
-                    byte[] audioPayload = Arrays.copyOfRange(data, 12, pktLen);
+                    byte[] audioPayload = Arrays.copyOfRange(data, rtp + 12, pktLen);
 
                     // AES-128-CBC decrypt (per-packet reset)
                     try {
@@ -125,10 +181,10 @@ public class AudioReceiver implements Runnable {
                         byte[] pcm = decodeAacEld(audioPayload);
                         if (pcm != null) {
                             // Enqueue to ring buffer, dequeue in order to pcmQueue
-                            enqueueAndDequeue(seqnum, pcm);
+                            enqueueAndDequeue(seqnum, new PcmFrame(pcm, rtpTime));
                         }
                     } else if (!isAacEld && audioPayload.length > 4) {
-                        pushToPlaybackQueue(audioPayload);
+                        pushToPlaybackQueue(new PcmFrame(audioPayload, rtpTime));
                     }
 
                     if (packetCount <= 3 || packetCount % 500 == 0) {
@@ -154,9 +210,9 @@ public class AudioReceiver implements Runnable {
         Log.i(TAG, "Playback thread started");
         while (!Thread.currentThread().isInterrupted()) {
             try {
-                byte[] pcm = pcmQueue.poll(100, TimeUnit.MILLISECONDS);
-                if (pcm != null) {
-                    callback.onAudio(pcm);
+                PcmFrame frame = pcmQueue.poll(100, TimeUnit.MILLISECONDS);
+                if (frame != null) {
+                    callback.onAudio(frame.pcm, frame.rtpTime);
                 }
             } catch (InterruptedException e) {
                 break;
@@ -168,19 +224,30 @@ public class AudioReceiver implements Runnable {
     /**
      * Push PCM to playback queue (non-blocking, drops oldest if full like reference)
      */
-    private void pushToPlaybackQueue(byte[] pcm) {
-        if (!pcmQueue.offer(pcm)) {
+    private void pushToPlaybackQueue(PcmFrame frame) {
+        if (!pcmQueue.offer(frame)) {
             // Queue full - drop oldest frame (like reference AUDIO_QUEUE_MAX_FRAMES limit)
             pcmQueue.poll();
-            pcmQueue.offer(pcm);
+            pcmQueue.offer(frame);
         }
+    }
+
+    /**
+     * True if this sequence number has already been through the decoder, whether it has been
+     * handed to playback or is still sitting in the ring buffer waiting its turn.
+     */
+    private boolean alreadySeen(int seqnum) {
+        if (bufferEmpty) return false;
+        if (seqCmp(seqnum, firstSeq) < 0) return true;
+        int idx = seqnum % BUFFER_SIZE;
+        return slotAvailable[idx] && seqNumbers[idx] == seqnum;
     }
 
     /**
      * Ring buffer enqueue + in-order dequeue (reference: raop_buffer.c)
      * no_resend=1: always advance, play silence for gaps
      */
-    private void enqueueAndDequeue(int seqnum, byte[] pcm) {
+    private void enqueueAndDequeue(int seqnum, PcmFrame frame) {
         if (bufferEmpty) {
             firstSeq = seqnum;
             lastSeq = seqnum;
@@ -198,7 +265,7 @@ public class AudioReceiver implements Runnable {
         // Store in ring buffer
         int idx = seqnum % BUFFER_SIZE;
         seqNumbers[idx] = seqnum;
-        pcmBuffer[idx] = pcm;
+        pcmBuffer[idx] = frame;
         slotAvailable[idx] = true;
 
         if (seqCmp(seqnum, lastSeq) > 0) lastSeq = seqnum;
@@ -208,11 +275,15 @@ public class AudioReceiver implements Runnable {
             int fidx = firstSeq % BUFFER_SIZE;
             if (slotAvailable[fidx]) {
                 pushToPlaybackQueue(pcmBuffer[fidx]);
+                lastPushedRtp = pcmBuffer[fidx].rtpTime;
                 slotAvailable[fidx] = false;
                 pcmBuffer[fidx] = null;
             } else {
-                // Missing packet - push silence (like reference: memset(entry->audio_buffer, 0, ...))
-                pushToPlaybackQueue(new byte[1920]);
+                // Missing packet - push silence (like reference: memset(entry->audio_buffer, 0, ...)).
+                // It still has to carry a timestamp, otherwise the gap would shift every later
+                // sample against the picture; every packet is exactly SAMPLES_PER_PACKET long.
+                lastPushedRtp += SAMPLES_PER_PACKET;
+                pushToPlaybackQueue(new PcmFrame(new byte[SILENCE_BYTES], lastPushedRtp));
             }
             firstSeq++;
         }

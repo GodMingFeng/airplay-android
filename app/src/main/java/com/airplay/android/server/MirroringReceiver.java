@@ -29,8 +29,6 @@ public class MirroringReceiver implements Runnable {
     private final AirPlay airPlay;
     private final VideoCallbackInterface callback;
     private ServerSocket serverSocket;
-    /** Sender clock of the first frame, so presentation timestamps start at zero. */
-    private long ptsBaseUs;
 
     public MirroringReceiver(int port, AirPlay airPlay, VideoCallbackInterface callback) {
         this.port = port;
@@ -79,17 +77,12 @@ public class MirroringReceiver implements Runnable {
 
                 if (payloadType == 0) {
                     // Video data. The header carries the sender's NTP clock at offset 8, which is
-                    // the only timestamp source for the decoder.
-                    long frameUs = ntpToMicros(header.getLong(8));
-                    long ptsUs = 0;
-                    if (ptsBaseUs == 0) {
-                        ptsBaseUs = frameUs;
-                    } else {
-                        ptsUs = frameUs - ptsBaseUs;
-                    }
+                    // the same clock the RAOP sync packets stamp the audio with, so it is passed
+                    // on untouched: the two only line up while they share an origin.
+                    long senderUs = ntpToMicros(header.getLong(8));
                     try {
                         airPlay.decryptVideo(payload);
-                        processVideo(payload, ptsUs);
+                        processVideo(payload, senderUs);
                     } catch (Exception e) {
                         Log.e(TAG, "Error video, size: " + payload.length, e);
                     }
@@ -153,7 +146,7 @@ public class MirroringReceiver implements Runnable {
         return width >= 16 && height >= 16 && width <= 8192 && height <= 8192;
     }
 
-    private void processVideo(byte[] payload, long ptsUs) {
+    private void processVideo(byte[] payload, long senderUs) {
         // Convert NALU length prefix from 4-byte big-endian to Annex B (0x00000001)
         int offset = 0;
         while (offset < payload.length) {
@@ -180,7 +173,7 @@ public class MirroringReceiver implements Runnable {
             offset += 4 + naluLen;
         }
 
-        callback.onVideo(payload, ptsUs);
+        callback.onVideo(payload, senderUs);
     }
 
     private void processSPSPPS(byte[] payload) {

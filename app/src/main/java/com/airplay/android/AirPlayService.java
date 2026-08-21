@@ -244,8 +244,8 @@ public class AirPlayService extends Service {
         }
 
         @Override
-        public void onAudio(byte[] audio) {
-            VideoHolder.onAudioData(audio);
+        public void onAudio(byte[] audio, long rtpTime) {
+            VideoHolder.onAudioData(audio, rtpTime);
         }
 
         @Override

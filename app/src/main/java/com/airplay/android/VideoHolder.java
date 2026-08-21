@@ -29,22 +29,15 @@ public class VideoHolder {
      * Access units held between the receiving thread and the codec. Deep enough to ride out a
      * decoder hiccup; dropping is a last resort because it breaks the H.264 reference chain.
      */
-    private static final int MAX_PENDING_FRAMES = 16;
+    private static final int MAX_PENDING_FRAMES = 64;
     /**
-     * How far behind arrival the picture is put on screen, in nanoseconds. Zero renders each
-     * frame as soon as it is decoded.
-     *
-     * <p>Deliberately off: a scheduled release keeps the output buffer checked out until its
-     * render deadline, and with only a handful of them the decoder stalls, stops recycling input
-     * buffers and the queue above starts dropping frames. Measured at 40ms on a BRAVIA AE2 that
-     * cost ~20% of all frames, which looks far worse than the jitter it was meant to smooth.
+     * Longest a frame may be held back waiting for the sound to catch up. Measured on this TV the
+     * hold settles around 300ms, almost all of it the set's own audio output path, so the limit is
+     * set well clear of that; it is only there to stop a nonsensical reading freezing the screen.
+     * It also has to stay inside {@link #MAX_PENDING_FRAMES} worth of playback, otherwise the held
+     * frames overflow the queue and get dropped.
      */
-    private static final long PACING_DELAY_NS = 0L;
-    /**
-     * Mirroring only sends frames when the screen changes, so a gap of any length is normal.
-     * Once the target is this far out the pacing base is simply re-anchored to now.
-     */
-    private static final long MAX_PACING_AHEAD_NS = 250_000_000L;
+    private static final long MAX_HOLD_NS = 600_000_000L;
 
     /** Guards the decoder lifecycle and the queues below. Never held across a blocking call. */
     private static final Object LOCK = new Object();
@@ -54,10 +47,17 @@ public class VideoHolder {
      * surface. Held across stop()/release(), so it must never be taken while holding {@link #LOCK}.
      */
     private static final Object LIFECYCLE_LOCK = new Object();
+    /**
+     * Guards {@link #sAudioPlayer} only. Kept apart from {@link #LOCK} so that building an
+     * AudioTrack, which takes a few milliseconds, cannot hold up a codec callback.
+     */
+    private static final Object AUDIO_LOCK = new Object();
 
     private static Surface sSurface;
     private static MediaCodec sDecoder;
     private static HandlerThread sCodecThread;
+    /** Runs the codec callbacks and the delayed hand-off of frames that are not due yet. */
+    private static Handler sCodecHandler;
     private static byte[] sSpsPps;
     private static boolean sConfigured;
     /** Set from the codec error callback; the receiving thread rebuilds on the next frame. */
@@ -69,9 +69,8 @@ public class VideoHolder {
     /** Input buffers the codec has handed out and that have nothing to carry yet. */
     private static final ArrayDeque<Integer> sFreeInputs = new ArrayDeque<>();
 
-    private static boolean sPacingAnchored;
-    private static long sPacingBaseNs;
-    private static long sPacingBasePtsUs;
+    /** True while a delayed {@link #FEED} is already queued, so only one is ever outstanding. */
+    private static boolean sFeedScheduled;
 
     private static long sFrameCount;
     private static long sDroppedFrames;
@@ -86,11 +85,12 @@ public class VideoHolder {
 
     private static final class Frame {
         final byte[] data;
-        final long ptsUs;
+        /** Sender NTP time this picture was captured at, or 0 for the parameter sets. */
+        final long senderUs;
 
-        Frame(byte[] data, long ptsUs) {
+        Frame(byte[] data, long senderUs) {
             this.data = data;
-            this.ptsUs = ptsUs;
+            this.senderUs = senderUs;
         }
     }
 
@@ -113,6 +113,7 @@ public class VideoHolder {
      * session's SPS/PPS anyway, and tearing it down here would race with the receiving threads.
      */
     public static void notifySessionEnded() {
+        AvSync.reset();
         synchronized (LOCK) {
             if (sVideoWidth == 0 && sVideoHeight == 0) return;
             sVideoWidth = 0;
@@ -136,14 +137,17 @@ public class VideoHolder {
         MediaCodec decoder;
         HandlerThread thread;
         AudioPlayer audioPlayer;
+        synchronized (AUDIO_LOCK) {
+            audioPlayer = sAudioPlayer;
+            sAudioPlayer = null;
+        }
         synchronized (LIFECYCLE_LOCK) {
             synchronized (LOCK) {
                 decoder = sDecoder;
                 thread = sCodecThread;
-                audioPlayer = sAudioPlayer;
                 sDecoder = null;
                 sCodecThread = null;
-                sAudioPlayer = null;
+                sCodecHandler = null;
                 sSurface = null;
                 sVideoWidth = 0;
                 sVideoHeight = 0;
@@ -162,7 +166,10 @@ public class VideoHolder {
         sNeedsRestart = false;
         sPending.clear();
         sFreeInputs.clear();
-        sPacingAnchored = false;
+        if (sCodecHandler != null) {
+            sCodecHandler.removeCallbacks(FEED);
+        }
+        sFeedScheduled = false;
     }
 
     private static void disposeDecoder(MediaCodec decoder, HandlerThread thread) {
@@ -202,6 +209,7 @@ public class VideoHolder {
 
             MediaCodec decoder = null;
             HandlerThread thread = null;
+            Handler handler = null;
             try {
                 MediaFormat format = MediaFormat.createVideoFormat("video/avc", width, height);
                 format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, MAX_INPUT_SIZE);
@@ -216,9 +224,10 @@ public class VideoHolder {
 
                 thread = new HandlerThread("VideoDecoder");
                 thread.start();
+                handler = new Handler(thread.getLooper());
 
                 decoder = MediaCodec.createDecoderByType("video/avc");
-                decoder.setCallback(CALLBACK, new Handler(thread.getLooper()));
+                decoder.setCallback(CALLBACK, handler);
                 decoder.configure(format, surface, null, 0);
                 decoder.setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT);
                 decoder.start();
@@ -231,6 +240,7 @@ public class VideoHolder {
             synchronized (LOCK) {
                 sDecoder = decoder;
                 sCodecThread = thread;
+                sCodecHandler = handler;
                 sConfigured = true;
                 // The parameter sets are handed over in-band as the first access unit instead of
                 // through csd-0/csd-1: the sender repeats them whenever the geometry changes, and
@@ -307,8 +317,8 @@ public class VideoHolder {
         notifyVideoSize(width, height);
     }
 
-    /** @param ptsUs presentation timestamp derived from the sender's clock, in microseconds */
-    public static void onVideoData(byte[] video, long ptsUs) {
+    /** @param senderUs time on the sender's NTP clock at which this picture was captured */
+    public static void onVideoData(byte[] video, long senderUs) {
         byte[] spsPps = null;
         synchronized (LOCK) {
             if (sNeedsRestart) {
@@ -327,7 +337,7 @@ public class VideoHolder {
                     sPending.pollFirst();
                     sDroppedFrames++;
                 }
-                sPending.addLast(new Frame(video, ptsUs));
+                sPending.addLast(new Frame(video, senderUs));
                 feedCodecLocked();
                 if (sFrameCount % 300 == 0) {
                     Log.i(TAG, "Frame #" + sFrameCount + ": pending=" + sPending.size()
@@ -342,14 +352,27 @@ public class VideoHolder {
         startDecoder(spsPps);
     }
 
-    /** Pairs the access units that arrived with the input buffers the codec handed out. */
+    /**
+     * Pairs the access units that arrived with the input buffers the codec handed out, holding a
+     * frame back until the sound recorded with it is about to be heard.
+     */
     private static void feedCodecLocked() {
         MediaCodec decoder = sDecoder;
         if (decoder == null) return;
 
         while (!sFreeInputs.isEmpty() && !sPending.isEmpty()) {
+            Frame frame = sPending.peekFirst();
+            long waitNs = holdTimeNsLocked(frame);
+            if (waitNs > 0) {
+                // Waiting here rather than at releaseOutputBuffer is deliberate: a timed release
+                // pins an output buffer until its deadline, and there are only a handful of them,
+                // so the decoder stalls and frames get dropped. Holding on the input side costs
+                // nothing but a slot in a queue we already have.
+                scheduleFeedLocked(waitNs);
+                return;
+            }
+            sPending.pollFirst();
             int index = sFreeInputs.pollFirst();
-            Frame frame = sPending.pollFirst();
             try {
                 ByteBuffer inputBuffer = decoder.getInputBuffer(index);
                 if (inputBuffer == null) continue;
@@ -361,7 +384,7 @@ public class VideoHolder {
                 }
                 inputBuffer.clear();
                 inputBuffer.put(frame.data);
-                decoder.queueInputBuffer(index, 0, frame.data.length, frame.ptsUs, 0);
+                decoder.queueInputBuffer(index, 0, frame.data.length, frame.senderUs, 0);
             } catch (IllegalStateException e) {
                 Log.w(TAG, "Codec rejected input buffer " + index, e);
                 return;
@@ -369,26 +392,36 @@ public class VideoHolder {
         }
     }
 
-    /**
-     * Turns a sender timestamp into a moment on the local clock to put the frame on screen.
-     * Handing that to the codec lets it line the frame up with a vsync instead of flushing
-     * whatever arrived in the last burst all at once.
-     */
-    private static long renderTimeLocked(long ptsUs) {
-        long now = System.nanoTime();
-        if (sPacingAnchored) {
-            long target = sPacingBaseNs + (ptsUs - sPacingBasePtsUs) * 1000L;
-            if (target >= now && target <= now + MAX_PACING_AHEAD_NS) {
-                return target;
-            }
-            // Either the frame is already late or the sender skipped ahead (mirroring only
-            // sends on screen changes): start the smoothing window over from here
-        }
-        sPacingAnchored = true;
-        sPacingBasePtsUs = ptsUs;
-        sPacingBaseNs = now + PACING_DELAY_NS;
-        return sPacingBaseNs;
+    /** How much longer this frame has to wait for the audio, 0 if it should go through now. */
+    private static long holdTimeNsLocked(Frame frame) {
+        // The parameter sets belong to no instant in particular and must never be delayed
+        if (frame.senderUs <= 0) return 0;
+        long dueNs = AvSync.localNanosForSenderUs(frame.senderUs);
+        if (dueNs == AvSync.NO_TIME) return 0; // No audio to sync against yet
+        long waitNs = dueNs - System.nanoTime();
+        if (waitNs <= 0) return 0;
+        // A wait this long is not a lip sync correction, it is a bad reading. Show the frame.
+        if (waitNs > MAX_HOLD_NS) return 0;
+        return waitNs;
     }
+
+    private static void scheduleFeedLocked(long delayNs) {
+        Handler handler = sCodecHandler;
+        if (handler == null || sFeedScheduled) return;
+        sFeedScheduled = true;
+        handler.postDelayed(FEED, Math.max(1L, delayNs / 1_000_000L));
+    }
+
+    /** Retries the hand-off once the frame at the head of the queue has become due. */
+    private static final Runnable FEED = new Runnable() {
+        @Override
+        public void run() {
+            synchronized (LOCK) {
+                sFeedScheduled = false;
+                feedCodecLocked();
+            }
+        }
+    };
 
     private static final MediaCodec.Callback CALLBACK = new MediaCodec.Callback() {
         @Override
@@ -402,21 +435,10 @@ public class VideoHolder {
 
         @Override
         public void onOutputBufferAvailable(MediaCodec codec, int index, MediaCodec.BufferInfo info) {
-            if (PACING_DELAY_NS <= 0) {
-                try {
-                    codec.releaseOutputBuffer(index, true);
-                } catch (IllegalStateException e) {
-                    Log.w(TAG, "Codec rejected output buffer " + index, e);
-                }
-                return;
-            }
-            long renderNs;
-            synchronized (LOCK) {
-                if (codec != sDecoder) return;
-                renderNs = renderTimeLocked(info.presentationTimeUs);
-            }
+            // Straight to the screen: the wait for the audio already happened before this frame
+            // was handed to the decoder, so there is nothing left to time here.
             try {
-                codec.releaseOutputBuffer(index, renderNs);
+                codec.releaseOutputBuffer(index, true);
             } catch (IllegalStateException e) {
                 Log.w(TAG, "Codec rejected output buffer " + index, e);
             }
@@ -447,14 +469,14 @@ public class VideoHolder {
         }
     };
 
-    public static void onAudioData(byte[] audio) {
+    public static void onAudioData(byte[] audio, long rtpTime) {
         AudioPlayer player;
-        synchronized (LOCK) {
+        synchronized (AUDIO_LOCK) {
             if (sAudioPlayer == null) {
                 sAudioPlayer = new AudioPlayer();
             }
             player = sAudioPlayer;
         }
-        player.play(audio);
+        player.play(audio, rtpTime);
     }
 }
