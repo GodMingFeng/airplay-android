@@ -1,7 +1,7 @@
 package com.airplay.android;
 
 public interface VideoCallbackInterface {
-    void onVideo(byte[] video);
+    void onVideo(byte[] video, long ptsUs);
     void onVideoFormat(int width, int height);
     void onAudio(byte[] audio);
     void onAudioFormat(int sampleRate, int channels);

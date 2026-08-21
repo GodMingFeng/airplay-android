@@ -105,31 +105,16 @@ public class VideoHolder {
             int width = sHeaderWidth > 0 ? sHeaderWidth : DEFAULT_WIDTH;
             int height = sHeaderHeight > 0 ? sHeaderHeight : DEFAULT_HEIGHT;
             MediaFormat format = MediaFormat.createVideoFormat("video/avc", width, height);
-            // Extract SPS and PPS from the combined array
-            int spsStart = 4; // skip 0x00000001
-            int spsEnd = spsStart;
-            while (spsEnd < spsPps.length - 4) {
-                if (spsPps[spsEnd] == 0 && spsPps[spsEnd + 1] == 0
-                        && spsPps[spsEnd + 2] == 0 && spsPps[spsEnd + 3] == 1) {
-                    break;
-                }
-                spsEnd++;
-            }
-            byte[] sps = new byte[spsEnd - spsStart];
-            System.arraycopy(spsPps, spsStart, sps, 0, sps.length);
-
-            int ppsStart = spsEnd + 4; // skip second 0x00000001
-            byte[] pps = new byte[spsPps.length - ppsStart];
-            System.arraycopy(spsPps, ppsStart, pps, 0, pps.length);
-
-            format.setByteBuffer("csd-0", ByteBuffer.wrap(sps));
-            format.setByteBuffer("csd-1", ByteBuffer.wrap(pps));
-
             sDecoder.configure(format, sSurface, null, 0);
             sDecoder.setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT);
             sDecoder.start();
             sConfigured = true;
-            Log.i(TAG, "Decoder configured with SPS/PPS at " + width + "x" + height);
+            Log.i(TAG, "Decoder configured at " + width + "x" + height);
+            // The parameter sets are handed over in-band as the first access unit instead of
+            // through csd-0/csd-1: the sender repeats them whenever the geometry changes, and
+            // hardware decoders that drive a TV video plane only pick them up from the
+            // bitstream itself.
+            submitToDecoder(spsPps, 0);
         } catch (Exception e) {
             Log.e(TAG, "Failed to configure decoder", e);
         }
@@ -197,26 +182,31 @@ public class VideoHolder {
 
     private static int sFrameCount = 0;
 
-    public static synchronized void onVideoData(byte[] video) {
+    /** @param ptsUs presentation timestamp derived from the sender's clock, in microseconds */
+    public static synchronized void onVideoData(byte[] video, long ptsUs) {
         if (sDecoder == null || !sConfigured) {
             if (sFrameCount == 0) {
-                android.util.Log.w(TAG, "onVideoData: decoder not ready, sDecoder=" + (sDecoder != null) + " sConfigured=" + sConfigured);
+                Log.w(TAG, "onVideoData: decoder not ready, sDecoder=" + (sDecoder != null) + " sConfigured=" + sConfigured);
             }
             return;
         }
         sFrameCount++;
+        submitToDecoder(video, ptsUs);
+    }
 
+    /** Feeds one access unit to the decoder and renders whatever it hands back. */
+    private static void submitToDecoder(byte[] data, long ptsUs) {
         try {
             int inputIndex = sDecoder.dequeueInputBuffer(10000);
             if (inputIndex >= 0) {
                 ByteBuffer inputBuffer = sDecoder.getInputBuffer(inputIndex);
                 if (inputBuffer != null) {
                     inputBuffer.clear();
-                    inputBuffer.put(video);
-                    sDecoder.queueInputBuffer(inputIndex, 0, video.length, 0, 0);
+                    inputBuffer.put(data);
+                    sDecoder.queueInputBuffer(inputIndex, 0, data.length, ptsUs, 0);
                 }
             } else {
-                android.util.Log.w(TAG, "No input buffer available (frame #" + sFrameCount + ")");
+                Log.w(TAG, "No input buffer available (frame #" + sFrameCount + ")");
             }
 
             // Drain output
@@ -230,15 +220,16 @@ public class VideoHolder {
                     framesRendered++;
                 } else if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                     MediaFormat outputFormat = sDecoder.getOutputFormat();
-                    android.util.Log.i(TAG, "Output format changed: " + outputFormat);
+                    Log.i(TAG, "Output format changed: " + outputFormat);
                     updateVideoSizeFromOutputFormat(outputFormat);
                 }
-            } while (outputIndex >= 0);
+            } while (outputIndex >= 0 || outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED);
             if (framesRendered > 0 || sFrameCount <= 5 || sFrameCount % 100 == 0) {
-                android.util.Log.i(TAG, "Frame #" + sFrameCount + ": rendered=" + framesRendered + ", size=" + video.length);
+                Log.i(TAG, "Frame #" + sFrameCount + ": rendered=" + framesRendered
+                        + ", size=" + data.length + ", pts=" + ptsUs);
             }
         } catch (Exception e) {
-            android.util.Log.e(TAG, "Error decoding video frame #" + sFrameCount, e);
+            Log.e(TAG, "Error decoding video frame #" + sFrameCount, e);
         }
     }
 

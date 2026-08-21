@@ -233,8 +233,8 @@ public class AirPlayService extends Service {
 
     private static class VideoCallback implements VideoCallbackInterface {
         @Override
-        public void onVideo(byte[] video) {
-            VideoHolder.onVideoData(video);
+        public void onVideo(byte[] video, long ptsUs) {
+            VideoHolder.onVideoData(video, ptsUs);
         }
 
         @Override

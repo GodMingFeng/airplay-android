@@ -20,7 +20,8 @@ public class MirroringReceiver implements Runnable {
     private final AirPlay airPlay;
     private final VideoCallbackInterface callback;
     private ServerSocket serverSocket;
-    private byte[] spsPps = new byte[0];
+    /** Sender clock of the first frame, so presentation timestamps start at zero. */
+    private long ptsBaseUs;
 
     public MirroringReceiver(int port, AirPlay airPlay, VideoCallbackInterface callback) {
         this.port = port;
@@ -58,7 +59,6 @@ public class MirroringReceiver implements Runnable {
                 int payloadSize = header.getInt(0);
                 short payloadType = (short) (header.getShort(4) & 0xFF);
                 // short payloadOption = header.getShort(6);
-                Log.i(TAG, "Header: payloadSize=" + payloadSize + ", payloadType=" + payloadType);
 
                 if (payloadSize <= 0 || payloadSize > 2 * 1024 * 1024) {
                     Log.w(TAG, "Invalid payload size: " + payloadSize);
@@ -78,11 +78,18 @@ public class MirroringReceiver implements Runnable {
                 }
 
                 if (payloadType == 0) {
-                    // Video data
+                    // Video data. The header carries the sender's NTP clock at offset 8, which is
+                    // the only timestamp source for the decoder.
+                    long frameUs = ntpToMicros(header.getLong(8));
+                    long ptsUs = 0;
+                    if (ptsBaseUs == 0) {
+                        ptsBaseUs = frameUs;
+                    } else {
+                        ptsUs = frameUs - ptsBaseUs;
+                    }
                     try {
                         airPlay.decryptVideo(payload);
-                        processVideo(payload);
-                        Log.i(TAG, "Video frame OK, size: " + payload.length);
+                        processVideo(payload, ptsUs);
                     } catch (Exception e) {
                         Log.e(TAG, "Error video, size: " + payload.length, e);
                     }
@@ -102,6 +109,13 @@ public class MirroringReceiver implements Runnable {
                 Log.e(TAG, "Mirroring receiver error", e);
             }
         }
+    }
+
+    /** Converts an NTP timestamp as carried in the mirroring header into microseconds. */
+    private static long ntpToMicros(long ntp) {
+        long seconds = (ntp >>> 32) & 0xFFFFFFFFL;
+        long fraction = ntp & 0xFFFFFFFFL;
+        return seconds * 1_000_000L + fraction * 1_000_000L / 0x1_0000_0000L;
     }
 
     /**
@@ -131,10 +145,9 @@ public class MirroringReceiver implements Runnable {
         return width >= 16 && height >= 16 && width <= 8192 && height <= 8192;
     }
 
-    private void processVideo(byte[] payload) {
+    private void processVideo(byte[] payload, long ptsUs) {
         // Convert NALU length prefix from 4-byte big-endian to Annex B (0x00000001)
         int offset = 0;
-        int naluCount = 0;
         while (offset < payload.length) {
             if (offset + 4 > payload.length) break;
             int naluLen = ((payload[offset] & 0xFF) << 24)
@@ -157,25 +170,9 @@ public class MirroringReceiver implements Runnable {
             payload[offset + 2] = 0;
             payload[offset + 3] = 1;
             offset += 4 + naluLen;
-            naluCount++;
         }
 
-        Log.i(TAG, "processVideo: " + naluCount + " NALUs, total=" + payload.length + ", first4=" +
-                String.format("%02x%02x%02x%02x", payload[0], payload[1], payload[2], payload[3]) +
-                ", naluType=" + (payload.length > 4 ? (payload[4] & 0x1F) : -1));
-
-        // Check NALU type and prepend SPS/PPS for IDR frames
-        int naluType = payload.length > 4 ? (payload[4] & 0x1F) : 0;
-        if (naluType == 5 && spsPps.length > 0) {
-            // IDR frame - prepend SPS/PPS
-            byte[] combined = new byte[spsPps.length + payload.length];
-            System.arraycopy(spsPps, 0, combined, 0, spsPps.length);
-            System.arraycopy(payload, 0, combined, spsPps.length, payload.length);
-            Log.i(TAG, "IDR frame: prepended SPS/PPS (" + spsPps.length + " bytes), total=" + combined.length);
-            callback.onVideo(combined);
-        } else {
-            callback.onVideo(payload);
-        }
+        callback.onVideo(payload, ptsUs);
     }
 
     private void processSPSPPS(byte[] payload) {
@@ -195,7 +192,7 @@ public class MirroringReceiver implements Runnable {
         buf.get(pps);
 
         // Build Annex B format: [00 00 00 01] [SPS] [00 00 00 01] [PPS]
-        this.spsPps = new byte[sps.length + pps.length + 8];
+        byte[] spsPps = new byte[sps.length + pps.length + 8];
         spsPps[0] = 0; spsPps[1] = 0; spsPps[2] = 0; spsPps[3] = 1;
         System.arraycopy(sps, 0, spsPps, 4, sps.length);
         spsPps[sps.length + 4] = 0; spsPps[sps.length + 5] = 0;
@@ -203,7 +200,7 @@ public class MirroringReceiver implements Runnable {
         System.arraycopy(pps, 0, spsPps, 8 + sps.length, pps.length);
 
         Log.i(TAG, "SPS/PPS: sps=" + sps.length + " pps=" + pps.length);
-        callback.onSpsPps(this.spsPps);
+        callback.onSpsPps(spsPps);
     }
 
 
