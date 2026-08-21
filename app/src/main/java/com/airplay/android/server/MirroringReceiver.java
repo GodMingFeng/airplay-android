@@ -1,11 +1,14 @@
 package com.airplay.android.server;
 
+import android.os.Process;
 import android.util.Log;
 
 import com.airplay.android.VideoCallbackInterface;
 import com.github.serezhka.jap2lib.AirPlay;
 
+import java.io.BufferedInputStream;
 import java.io.DataInputStream;
+import java.io.EOFException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -15,6 +18,12 @@ import java.nio.ByteOrder;
 public class MirroringReceiver implements Runnable {
     private static final String TAG = "MirroringReceiver";
     private static final int HEADER_SIZE = 128;
+    private static final int MAX_PAYLOAD_SIZE = 2 * 1024 * 1024;
+    /**
+     * Mirroring bursts several hundred kilobytes at a time on a key frame. A receive window this
+     * large keeps the sender from stalling while a frame is being decrypted.
+     */
+    private static final int SOCKET_RECEIVE_BUFFER = 1024 * 1024;
 
     private final int port;
     private final AirPlay airPlay;
@@ -31,51 +40,42 @@ public class MirroringReceiver implements Runnable {
 
     @Override
     public void run() {
+        // This thread does nothing but drain the socket and decrypt; if it loses the CPU the
+        // sender's window fills up and the picture stutters, so it runs above the default
+        Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY);
         try {
             serverSocket = new ServerSocket();
             serverSocket.setReuseAddress(true);
+            // Has to be set before bind so that accepted sockets inherit the scaled window
+            serverSocket.setReceiveBufferSize(SOCKET_RECEIVE_BUFFER);
             serverSocket.bind(new InetSocketAddress(port));
             Log.i(TAG, "Mirroring receiver listening on port " + port);
 
             Socket client = serverSocket.accept();
+            client.setTcpNoDelay(true);
             Log.i(TAG, "Mirroring client connected");
-            DataInputStream in = new DataInputStream(client.getInputStream());
+            DataInputStream in = new DataInputStream(
+                    new BufferedInputStream(client.getInputStream(), 64 * 1024));
 
             byte[] headerBuf = new byte[HEADER_SIZE];
 
             while (!Thread.currentThread().isInterrupted()) {
                 // Read header (128 bytes, little-endian)
-                int headerRead = 0;
-                while (headerRead < HEADER_SIZE) {
-                    int n = in.read(headerBuf, headerRead, HEADER_SIZE - headerRead);
-                    if (n < 0) {
-                        Log.i(TAG, "Mirroring client disconnected");
-                        return;
-                    }
-                    headerRead += n;
-                }
+                in.readFully(headerBuf, 0, HEADER_SIZE);
 
                 ByteBuffer header = ByteBuffer.wrap(headerBuf).order(ByteOrder.LITTLE_ENDIAN);
                 int payloadSize = header.getInt(0);
                 short payloadType = (short) (header.getShort(4) & 0xFF);
                 // short payloadOption = header.getShort(6);
 
-                if (payloadSize <= 0 || payloadSize > 2 * 1024 * 1024) {
+                if (payloadSize <= 0 || payloadSize > MAX_PAYLOAD_SIZE) {
                     Log.w(TAG, "Invalid payload size: " + payloadSize);
                     continue;
                 }
 
                 // Read payload
                 byte[] payload = new byte[payloadSize];
-                int payloadRead = 0;
-                while (payloadRead < payloadSize) {
-                    int n = in.read(payload, payloadRead, payloadSize - payloadRead);
-                    if (n < 0) {
-                        Log.i(TAG, "Mirroring client disconnected during payload read");
-                        return;
-                    }
-                    payloadRead += n;
-                }
+                in.readFully(payload, 0, payloadSize);
 
                 if (payloadType == 0) {
                     // Video data. The header carries the sender's NTP clock at offset 8, which is
@@ -104,9 +104,17 @@ public class MirroringReceiver implements Runnable {
                     }
                 }
             }
+        } catch (EOFException e) {
+            Log.i(TAG, "Mirroring client disconnected");
         } catch (Exception e) {
             if (!Thread.currentThread().isInterrupted()) {
                 Log.e(TAG, "Mirroring receiver error", e);
+            }
+        } finally {
+            // Without this the listening socket outlives the thread and the next SETUP
+            // cannot bind the mirroring port again
+            if (serverSocket != null) {
+                try { serverSocket.close(); } catch (Exception e) { /* ignore */ }
             }
         }
     }
