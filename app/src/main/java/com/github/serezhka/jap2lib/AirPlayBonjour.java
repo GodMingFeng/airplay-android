@@ -39,20 +39,28 @@ public class AirPlayBonjour {
         // Bound to one address rather than JmmDNS, which follows every interface it can find and
         // registers the service once per interface. It then hears its own record as a conflict and
         // publishes a second "name (2)" entry, so the receiver shows up twice on the sender.
+        long t0 = System.currentTimeMillis();
         InetAddress address = primaryAddress();
         jmdns = JmDNS.create(address, "airplay-" + deviceId);
         log.info("mDNS bound to {}", address.getHostAddress());
+        log.info("AirPlayPerf: JmDNS.create() took {}ms on {}",
+                System.currentTimeMillis() - t0, address.getHostAddress());
 
+        long t1 = System.currentTimeMillis();
         airPlayService = ServiceInfo.create(serverName + AIRPLAY_SERVICE_TYPE,
                 serverName, airPlayPort, 0, 0, airPlayMDNSProps());
         jmdns.registerService(airPlayService);
         log.info("{} service is registered on port {}", serverName + AIRPLAY_SERVICE_TYPE, airPlayPort);
+        log.info("AirPlayPerf: _airplay registerService took {}ms", System.currentTimeMillis() - t1);
 
+        long t2 = System.currentTimeMillis();
         String airTunesServerName = deviceId + "@" + serverName;
         airTunesService = ServiceInfo.create(airTunesServerName + AIRTUNES_SERVICE_TYPE,
                 airTunesServerName, airTunesPort, 0, 0, airTunesMDNSProps());
         jmdns.registerService(airTunesService);
         log.info("{} service is registered on port {}", airTunesServerName + AIRTUNES_SERVICE_TYPE, airTunesPort);
+        log.info("AirPlayPerf: _raop registerService took {}ms; mDNS total {}ms",
+                System.currentTimeMillis() - t2, System.currentTimeMillis() - t0);
     }
 
     public void stop() {

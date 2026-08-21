@@ -1,5 +1,6 @@
 package com.airplay.android.server;
 
+import android.os.SystemClock;
 import android.util.Log;
 
 import com.airplay.android.VideoCallbackInterface;
@@ -42,6 +43,8 @@ import io.netty.handler.codec.rtsp.RtspVersions;
 
 public class RtspControlServer {
     private static final String TAG = "RtspControlServer";
+    /** Shared tag for the connection-timing trace; grep with `adb logcat -s AirPlayPerf`. */
+    private static final String PERF = "AirPlayPerf";
 
     private final int airPlayPort;
     private final int airTunesPort;
@@ -79,7 +82,10 @@ public class RtspControlServer {
                 .childHandler(new ChannelInitializer<SocketChannel>() {
                     @Override
                     protected void initChannel(SocketChannel ch) {
+                        long t0 = SystemClock.elapsedRealtime();
                         AirPlay airPlay = new AirPlay();
+                        Log.i(PERF, "new AirPlay() (Ed25519 key gen) took "
+                                + (SystemClock.elapsedRealtime() - t0) + "ms");
                         ch.pipeline().addLast(
                                 new RtspDecoder(),
                                 new RtspEncoder(),
@@ -141,6 +147,8 @@ public class RtspControlServer {
     private class RtspHandler extends ChannelInboundHandlerAdapter {
 
         private final AirPlay airPlay;
+        /** When this control connection opened, the zero point for every timing below. */
+        private long connectStartMs;
 
         RtspHandler(AirPlay airPlay) {
             this.airPlay = airPlay;
@@ -153,6 +161,8 @@ public class RtspControlServer {
          */
         @Override
         public void channelActive(ChannelHandlerContext ctx) throws Exception {
+            connectStartMs = SystemClock.elapsedRealtime();
+            Log.i(PERF, "Control connection opened from " + ctx.channel().remoteAddress());
             endVideo();
             endAudio();
             super.channelActive(ctx);
@@ -177,6 +187,9 @@ public class RtspControlServer {
             String method = request.method().toString();
             String uri = request.uri();
             Log.i(TAG, "Request: " + method + " " + uri);
+            long reqStartMs = SystemClock.elapsedRealtime();
+            Log.i(PERF, "+" + (reqStartMs - connectStartMs) + "ms since connect -> "
+                    + method + " " + uri);
 
             try {
                 if (!handleRequest(ctx, request)) {
@@ -193,6 +206,8 @@ public class RtspControlServer {
                 sendResponse(ctx, request,
                         createResponse(request, RtspResponseStatuses.INTERNAL_SERVER_ERROR));
             } finally {
+                Log.i(PERF, "handled " + method + " " + uri + " in "
+                        + (SystemClock.elapsedRealtime() - reqStartMs) + "ms");
                 // This handler is the end of the pipeline, so the buffer is released here and the
                 // message is not passed on. Doing both would hand the tail something already freed.
                 request.release();
@@ -295,7 +310,10 @@ public class RtspControlServer {
                     mirroringThread.start();
 
                     // Wait for server socket to bind
+                    long sleepStart = SystemClock.elapsedRealtime();
                     Thread.sleep(50);
+                    Log.i(PERF, "VIDEO SETUP fixed sleep(50) actually waited "
+                            + (SystemClock.elapsedRealtime() - sleepStart) + "ms");
 
                     airPlay.rtspSetupVideo(new ByteBufOutputStream(response.content()),
                             airPlayPort, airTunesPort, 7011);
@@ -330,14 +348,20 @@ public class RtspControlServer {
                             sampleRate, channels, isAacEld);
                     Thread audioThread = new Thread(receiver);
                     audioThread.start();
+                    long audioWaitStart = SystemClock.elapsedRealtime();
                     synchronized (monitor) { monitor.wait(5000); }
+                    Log.i(PERF, "AUDIO SETUP waited " + (SystemClock.elapsedRealtime() - audioWaitStart)
+                            + "ms for the audio socket (cap 5000), port=" + receiver.getPort());
 
                     // Start audio control server (UDP)
                     final Object controlMonitor = new Object();
                     AudioControlServer control = new AudioControlServer(controlMonitor);
                     Thread audioControlThread = new Thread(control);
                     audioControlThread.start();
+                    long controlWaitStart = SystemClock.elapsedRealtime();
                     synchronized (controlMonitor) { controlMonitor.wait(5000); }
+                    Log.i(PERF, "AUDIO SETUP waited " + (SystemClock.elapsedRealtime() - controlWaitStart)
+                            + "ms for the control socket (cap 5000), port=" + control.getPort());
 
                     synchronized (sessionLock) {
                         audioReceiver = receiver;

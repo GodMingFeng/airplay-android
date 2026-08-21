@@ -90,9 +90,12 @@ public class AudioReceiver implements Runnable {
     @Override
     public void run() {
         try {
+            long t0 = android.os.SystemClock.elapsedRealtime();
             socket = new DatagramSocket(new InetSocketAddress(0));
             port = socket.getLocalPort();
             Log.i(TAG, "Audio receiver listening on port " + port);
+            Log.i("AirPlayPerf", "Audio data socket bound on port " + port + " in "
+                    + (android.os.SystemClock.elapsedRealtime() - t0) + "ms, notifying SETUP");
 
             synchronized (monitor) {
                 monitor.notifyAll();

@@ -1,6 +1,7 @@
 package com.airplay.android.server;
 
 import android.os.Process;
+import android.os.SystemClock;
 import android.util.Log;
 
 import com.airplay.android.VideoCallbackInterface;
@@ -17,6 +18,8 @@ import java.nio.ByteOrder;
 
 public class MirroringReceiver implements Runnable {
     private static final String TAG = "MirroringReceiver";
+    /** Shared tag for the connection-timing trace; grep with `adb logcat -s AirPlayPerf`. */
+    private static final String PERF = "AirPlayPerf";
     private static final int HEADER_SIZE = 128;
     private static final int MAX_PAYLOAD_SIZE = 2 * 1024 * 1024;
     /**
@@ -44,6 +47,7 @@ public class MirroringReceiver implements Runnable {
         // This thread does nothing but drain the socket and decrypt; if it loses the CPU the
         // sender's window fills up and the picture stutters, so it runs above the default
         Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY);
+        long threadStart = SystemClock.elapsedRealtime();
         try {
             serverSocket = new ServerSocket();
             serverSocket.setReuseAddress(true);
@@ -51,15 +55,22 @@ public class MirroringReceiver implements Runnable {
             serverSocket.setReceiveBufferSize(SOCKET_RECEIVE_BUFFER);
             serverSocket.bind(new InetSocketAddress(port));
             Log.i(TAG, "Mirroring receiver listening on port " + port);
+            Log.i(PERF, "Mirroring socket bound on port " + port + " in "
+                    + (SystemClock.elapsedRealtime() - threadStart) + "ms");
 
+            long acceptStart = SystemClock.elapsedRealtime();
             Socket accepted = serverSocket.accept();
             accepted.setTcpNoDelay(true);
             client = accepted;
             Log.i(TAG, "Mirroring client connected");
+            Log.i(PERF, "Mirroring client connected after "
+                    + (SystemClock.elapsedRealtime() - acceptStart) + "ms wait on accept()");
             DataInputStream in = new DataInputStream(
                     new BufferedInputStream(accepted.getInputStream(), 64 * 1024));
 
             byte[] headerBuf = new byte[HEADER_SIZE];
+            boolean firstSpsPps = true;
+            boolean firstVideo = true;
 
             while (!stopping) {
                 // Read header (128 bytes, little-endian)
@@ -87,6 +98,12 @@ public class MirroringReceiver implements Runnable {
                     try {
                         airPlay.decryptVideo(payload);
                         processVideo(payload, senderUs);
+                        if (firstVideo) {
+                            firstVideo = false;
+                            Log.i(PERF, "First video frame decoded "
+                                    + (SystemClock.elapsedRealtime() - threadStart)
+                                    + "ms after the mirroring thread started");
+                        }
                     } catch (Exception e) {
                         Log.e(TAG, "Error video, size: " + payload.length, e);
                     }
@@ -94,6 +111,12 @@ public class MirroringReceiver implements Runnable {
                     // SPS/PPS packet: its 128 byte header also carries the source screen size
                     processVideoSize(header);
                     processSPSPPS(payload);
+                    if (firstSpsPps) {
+                        firstSpsPps = false;
+                        Log.i(PERF, "First SPS/PPS received "
+                                + (SystemClock.elapsedRealtime() - threadStart)
+                                + "ms after the mirroring thread started");
+                    }
                 } else {
                     // Ignore other payload types (including type=5 which is plist metadata, not audio)
                     if (payloadType != 5) {
