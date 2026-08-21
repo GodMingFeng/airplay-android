@@ -29,6 +29,9 @@ public class MirroringReceiver implements Runnable {
     private final AirPlay airPlay;
     private final VideoCallbackInterface callback;
     private ServerSocket serverSocket;
+    private Socket client;
+    /** Set by {@link #stop()} so the loop can tell a shutdown apart from a real failure. */
+    private volatile boolean stopping;
 
     public MirroringReceiver(int port, AirPlay airPlay, VideoCallbackInterface callback) {
         this.port = port;
@@ -49,15 +52,16 @@ public class MirroringReceiver implements Runnable {
             serverSocket.bind(new InetSocketAddress(port));
             Log.i(TAG, "Mirroring receiver listening on port " + port);
 
-            Socket client = serverSocket.accept();
-            client.setTcpNoDelay(true);
+            Socket accepted = serverSocket.accept();
+            accepted.setTcpNoDelay(true);
+            client = accepted;
             Log.i(TAG, "Mirroring client connected");
             DataInputStream in = new DataInputStream(
-                    new BufferedInputStream(client.getInputStream(), 64 * 1024));
+                    new BufferedInputStream(accepted.getInputStream(), 64 * 1024));
 
             byte[] headerBuf = new byte[HEADER_SIZE];
 
-            while (!Thread.currentThread().isInterrupted()) {
+            while (!stopping) {
                 // Read header (128 bytes, little-endian)
                 in.readFully(headerBuf, 0, HEADER_SIZE);
 
@@ -100,20 +104,37 @@ public class MirroringReceiver implements Runnable {
         } catch (EOFException e) {
             Log.i(TAG, "Mirroring client disconnected");
         } catch (Exception e) {
-            if (!Thread.currentThread().isInterrupted()) {
+            if (!stopping) {
                 Log.e(TAG, "Mirroring receiver error", e);
             }
         } finally {
             // Without this the listening socket outlives the thread and the next SETUP
             // cannot bind the mirroring port again
-            if (serverSocket != null) {
-                try { serverSocket.close(); } catch (Exception e) { /* ignore */ }
-            }
+            closeQuietly();
+            Log.i(TAG, "Mirroring receiver stopped");
+        }
+    }
+
+    /**
+     * Ends the session. Both sockets are closed rather than the thread interrupted, because the
+     * thread is parked in a blocking read that an interrupt does not reach.
+     */
+    public void stop() {
+        stopping = true;
+        closeQuietly();
+    }
+
+    private void closeQuietly() {
+        if (client != null) {
+            try { client.close(); } catch (Exception e) { /* ignore */ }
+        }
+        if (serverSocket != null) {
+            try { serverSocket.close(); } catch (Exception e) { /* ignore */ }
         }
     }
 
     /** Converts an NTP timestamp as carried in the mirroring header into microseconds. */
-    private static long ntpToMicros(long ntp) {
+    static long ntpToMicros(long ntp) {
         long seconds = (ntp >>> 32) & 0xFFFFFFFFL;
         long fraction = ntp & 0xFFFFFFFFL;
         return seconds * 1_000_000L + fraction * 1_000_000L / 0x1_0000_0000L;

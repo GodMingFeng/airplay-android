@@ -133,7 +133,13 @@ public class AudioPlayer {
         }
     }
 
-    public void play(byte[] audio, long rtpTime) {
+    /**
+     * Writes one decoded packet. Synchronised against {@link #release}, which now happens at the end
+     * of every session rather than only when the app goes away: without it a teardown could pull the
+     * track out from under a write. The monitor is uncontended in the ordinary case, one packet every
+     * eleven milliseconds against nothing else.
+     */
+    public synchronized void play(byte[] audio, long rtpTime) {
         AudioTrack track = audioTrack;
         if (track == null || audio.length == 0) return;
         try {
@@ -263,7 +269,7 @@ public class AudioPlayer {
         return sOutputLatencyMs;
     }
 
-    public void release() {
+    public synchronized void release() {
         AudioTrack track = audioTrack;
         audioTrack = null;
         sOutputLatencyMs = -1;

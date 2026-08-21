@@ -46,6 +46,9 @@ public class AudioReceiver implements Runnable {
     private int port;
     private MediaCodec decoder;
     private boolean decoderStarted = false;
+    private Thread playbackThread;
+    /** Set by {@link #stop()} so the loops can tell a shutdown apart from a real failure. */
+    private volatile boolean stopping;
 
     // PCM playback queue (decouples receive/decode from playback)
     private final ArrayBlockingQueue<PcmFrame> pcmQueue = new ArrayBlockingQueue<>(QUEUE_MAX_FRAMES);
@@ -100,7 +103,7 @@ public class AudioReceiver implements Runnable {
             }
 
             // Start playback thread (drains pcmQueue → AudioTrack)
-            Thread playbackThread = new Thread(this::playbackLoop, "AudioPlayback");
+            playbackThread = new Thread(this::playbackLoop, "AudioPlayback");
             playbackThread.setDaemon(true);
             playbackThread.start();
 
@@ -108,7 +111,7 @@ public class AudioReceiver implements Runnable {
 
             byte[] buf = new byte[4096];
             int packetCount = 0;
-            while (!Thread.currentThread().isInterrupted()) {
+            while (!stopping) {
                 DatagramPacket packet = new DatagramPacket(buf, buf.length);
                 socket.receive(packet);
 
@@ -196,11 +199,37 @@ public class AudioReceiver implements Runnable {
                 }
             }
         } catch (Exception e) {
-            if (!Thread.currentThread().isInterrupted()) Log.e(TAG, "Audio receiver error", e);
+            if (!stopping) Log.e(TAG, "Audio receiver error", e);
         } finally {
-            if (decoder != null) { decoder.stop(); decoder.release(); }
+            // Reached on teardown and on any failure alike. The AAC decoder in particular has to
+            // go back: MediaCodec instances are a device wide resource, and a session that keeps
+            // hold of one leaves fewer for the next.
+            stopping = true;
+            if (playbackThread != null) playbackThread.interrupt();
+            if (decoder != null) {
+                try {
+                    if (decoderStarted) decoder.stop();
+                    decoder.release();
+                } catch (Exception e) {
+                    Log.w(TAG, "Error releasing the audio decoder", e);
+                }
+                decoder = null;
+                decoderStarted = false;
+            }
             if (socket != null) socket.close();
+            Log.i(TAG, "Audio receiver stopped");
         }
+    }
+
+    /**
+     * Ends the session. The receive loop sits in a read with no timeout, so interrupting the
+     * thread would not budge it; closing the socket underneath is what wakes it, and the flag is
+     * what tells it the exception that follows was asked for.
+     */
+    public void stop() {
+        stopping = true;
+        if (socket != null) socket.close();
+        if (playbackThread != null) playbackThread.interrupt();
     }
 
     /**
@@ -208,10 +237,13 @@ public class AudioReceiver implements Runnable {
      */
     private void playbackLoop() {
         Log.i(TAG, "Playback thread started");
-        while (!Thread.currentThread().isInterrupted()) {
+        while (!stopping && !Thread.currentThread().isInterrupted()) {
             try {
                 PcmFrame frame = pcmQueue.poll(100, TimeUnit.MILLISECONDS);
-                if (frame != null) {
+                // The check is repeated after the wait: a frame picked up just as the session
+                // ends must not be handed on, or it would build the playback path back up
+                // moments after it was torn down
+                if (frame != null && !stopping) {
                     callback.onAudio(frame.pcm, frame.rtpTime);
                 }
             } catch (InterruptedException e) {
@@ -299,7 +331,11 @@ public class AudioReceiver implements Runnable {
         bufferEmpty = true;
     }
 
-    private static int seqCmp(int a, int b) {
+    /**
+     * Compares two RTP sequence numbers, which are 16 bit and wrap round, so 0 comes after 65535
+     * rather than long before it. Half the space in either direction counts as ahead.
+     */
+    static int seqCmp(int a, int b) {
         int diff = (a - b) & 0xFFFF;
         if (diff > 0x8000) return -1;
         if (diff == 0) return 0;

@@ -133,14 +133,31 @@ public class VideoHolder {
         startDecoder(spsPps);
     }
 
+    /**
+     * Lets go of the audio track at the end of a session.
+     *
+     * <p>Not merely tidiness. The track keeps around a tenth of a second of samples it accepted but
+     * never presented, and its playback head stops where the sound stopped. Carried into the next
+     * session that residue is the first thing heard, and worse, the ceiling reads the leftover as a
+     * queue already too deep and refuses packets until its escape hatch gives way, which is heard as
+     * a second or so of mangled audio on connecting. A new track starts the next session on the path
+     * that fills the buffer deliberately before playing.
+     */
+    public static void releaseAudio() {
+        AudioPlayer player;
+        synchronized (AUDIO_LOCK) {
+            player = sAudioPlayer;
+            sAudioPlayer = null;
+        }
+        if (player != null) {
+            player.release();
+        }
+    }
+
     public static void release() {
         MediaCodec decoder;
         HandlerThread thread;
-        AudioPlayer audioPlayer;
-        synchronized (AUDIO_LOCK) {
-            audioPlayer = sAudioPlayer;
-            sAudioPlayer = null;
-        }
+        releaseAudio();
         synchronized (LIFECYCLE_LOCK) {
             synchronized (LOCK) {
                 decoder = sDecoder;
@@ -155,9 +172,6 @@ public class VideoHolder {
             }
             // Outside LOCK: release() waits for the callback thread, which needs LOCK itself
             disposeDecoder(decoder, thread);
-        }
-        if (audioPlayer != null) {
-            audioPlayer.release();
         }
     }
 

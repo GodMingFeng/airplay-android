@@ -51,6 +51,15 @@ android {
         targetCompatibility JavaVersion.VERSION_11
     }
 
+    testOptions {
+        unitTests {
+            // The classes under test log as they go. Rather than mock the framework, let the
+            // stubs in android.jar return a default instead of throwing, which is all these
+            // tests need: none of them assert on anything the platform does.
+            returnDefaultValues = true
+        }
+    }
+
     packagingOptions {
         resources {
             excludes += ['META-INF/LICENSE*', 'META-INF/NOTICE*', 'META-INF/DEPENDENCIES',
@@ -76,4 +85,6 @@ dependencies {
 
     // Netty for RTSP server
     implementation 'io.netty:netty-all:4.1.94.Final'
+
+    testImplementation 'junit:junit:4.13.2'
 }

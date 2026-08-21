@@ -33,6 +33,7 @@ import io.netty.handler.codec.http.DefaultFullHttpResponse;
 import io.netty.handler.codec.http.FullHttpRequest;
 import io.netty.handler.codec.http.FullHttpResponse;
 import io.netty.handler.codec.http.HttpObjectAggregator;
+import io.netty.handler.codec.http.HttpResponseStatus;
 import io.netty.handler.codec.http.HttpUtil;
 import io.netty.handler.codec.rtsp.RtspDecoder;
 import io.netty.handler.codec.rtsp.RtspEncoder;
@@ -47,6 +48,19 @@ public class RtspControlServer {
     private final VideoCallbackInterface callback;
     private EventLoopGroup bossGroup;
     private EventLoopGroup workerGroup;
+
+    /**
+     * The receivers serving the session in progress. Only one is ever kept: the mirroring port is
+     * fixed, so a second sender could not be served alongside the first in any case.
+     *
+     * <p>They have to be held onto rather than left to their threads, because each one owns a
+     * socket and the audio one an AAC decoder as well. MediaCodec instances are a device wide
+     * resource, and a session that walks off with one leaves fewer for the next.
+     */
+    private final Object sessionLock = new Object();
+    private MirroringReceiver mirroringReceiver;
+    private AudioReceiver audioReceiver;
+    private AudioControlServer audioControlServer;
 
     public RtspControlServer(int airPlayPort, int airTunesPort, VideoCallbackInterface callback) {
         this.airPlayPort = airPlayPort;
@@ -83,8 +97,45 @@ public class RtspControlServer {
     }
 
     public void stop() {
+        endVideo();
+        endAudio();
         if (bossGroup != null) bossGroup.shutdownGracefully();
         if (workerGroup != null) workerGroup.shutdownGracefully();
+    }
+
+    /** Stops the mirroring receiver and lets go of the video decoder and the surface. */
+    private void endVideo() {
+        MirroringReceiver mirroring;
+        synchronized (sessionLock) {
+            mirroring = mirroringReceiver;
+            mirroringReceiver = null;
+        }
+        if (mirroring != null) {
+            Log.i(TAG, "Ending the video session");
+            mirroring.stop();
+        }
+        VideoHolder.notifySessionEnded();
+    }
+
+    /**
+     * Stops the audio receiver and its control channel, and lets go of the AAC decoder and the
+     * AudioTrack with them. The receiver goes first, so that nothing is still being written by the
+     * time the track is handed back.
+     */
+    private void endAudio() {
+        AudioReceiver audio;
+        AudioControlServer control;
+        synchronized (sessionLock) {
+            audio = audioReceiver;
+            audioReceiver = null;
+            control = audioControlServer;
+            audioControlServer = null;
+        }
+        if (audio == null && control == null) return;
+        Log.i(TAG, "Ending the audio session");
+        if (audio != null) audio.stop();
+        if (control != null) control.stop();
+        VideoHolder.releaseAudio();
     }
 
     private class RtspHandler extends ChannelInboundHandlerAdapter {
@@ -95,10 +146,30 @@ public class RtspControlServer {
             this.airPlay = airPlay;
         }
 
+        /**
+         * A fresh control connection means a fresh session, so anything the last one left behind
+         * goes now. Senders do not always send TEARDOWN, and one that simply vanished would
+         * otherwise keep its receivers running for the lifetime of the app.
+         */
         @Override
-        public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+        public void channelActive(ChannelHandlerContext ctx) throws Exception {
+            endVideo();
+            endAudio();
+            super.channelActive(ctx);
+        }
+
+        @Override
+        public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+            Log.i(TAG, "Control connection closed");
+            endVideo();
+            endAudio();
+            super.channelInactive(ctx);
+        }
+
+        @Override
+        public void channelRead(ChannelHandlerContext ctx, Object msg) {
             if (!(msg instanceof FullHttpRequest)) {
-                super.channelRead(ctx, msg);
+                ctx.fireChannelRead(msg);
                 return;
             }
 
@@ -108,16 +179,24 @@ public class RtspControlServer {
             Log.i(TAG, "Request: " + method + " " + uri);
 
             try {
-                if (handleRequest(ctx, request)) {
-                    return;
+                if (!handleRequest(ctx, request)) {
+                    // Everything gets an answer, even what is not recognised: a sender left
+                    // without one waits out its own timeout instead of carrying on
+                    Log.w(TAG, "Unhandled: " + method + " " + uri);
+                    sendResponse(ctx, request,
+                            createResponse(request, RtspResponseStatuses.NOT_IMPLEMENTED));
                 }
             } catch (Exception e) {
+                // Nothing has been written at this point: every path that answers does so as its
+                // last act, so there is no risk of a second response confusing the sender
                 Log.e(TAG, "Error handling " + method + " " + uri, e);
+                sendResponse(ctx, request,
+                        createResponse(request, RtspResponseStatuses.INTERNAL_SERVER_ERROR));
             } finally {
+                // This handler is the end of the pipeline, so the buffer is released here and the
+                // message is not passed on. Doing both would hand the tail something already freed.
                 request.release();
             }
-
-            super.channelRead(ctx, msg);
         }
 
         private boolean handleRequest(ChannelHandlerContext ctx, FullHttpRequest request) throws Exception {
@@ -177,7 +256,6 @@ public class RtspControlServer {
                 return sendResponse(ctx, request, response);
             }
 
-            Log.w(TAG, "Unhandled: " + method + " " + uri);
             return false;
         }
 
@@ -210,6 +288,9 @@ public class RtspControlServer {
 
                     // Start mirroring receiver
                     MirroringReceiver receiver = new MirroringReceiver(airPlayPort, airPlay, callback);
+                    synchronized (sessionLock) {
+                        mirroringReceiver = receiver;
+                    }
                     Thread mirroringThread = new Thread(receiver);
                     mirroringThread.start();
 
@@ -245,21 +326,26 @@ public class RtspControlServer {
 
                     // Start audio receiver (UDP)
                     final Object monitor = new Object();
-                    AudioReceiver audioReceiver = new AudioReceiver(airPlay, callback, monitor,
+                    AudioReceiver receiver = new AudioReceiver(airPlay, callback, monitor,
                             sampleRate, channels, isAacEld);
-                    Thread audioThread = new Thread(audioReceiver);
+                    Thread audioThread = new Thread(receiver);
                     audioThread.start();
                     synchronized (monitor) { monitor.wait(5000); }
 
                     // Start audio control server (UDP)
                     final Object controlMonitor = new Object();
-                    AudioControlServer audioControl = new AudioControlServer(controlMonitor);
-                    Thread audioControlThread = new Thread(audioControl);
+                    AudioControlServer control = new AudioControlServer(controlMonitor);
+                    Thread audioControlThread = new Thread(control);
                     audioControlThread.start();
                     synchronized (controlMonitor) { controlMonitor.wait(5000); }
 
+                    synchronized (sessionLock) {
+                        audioReceiver = receiver;
+                        audioControlServer = control;
+                    }
+
                     airPlay.rtspSetupAudio(new ByteBufOutputStream(response.content()),
-                            audioReceiver.getPort(), audioControl.getPort());
+                            receiver.getPort(), control.getPort());
                     return sendResponse(ctx, request, response);
                 }
             }
@@ -267,22 +353,30 @@ public class RtspControlServer {
         }
 
         private void handleTeardown(FullHttpRequest request) {
+            MediaStreamInfo info = null;
             try {
-                MediaStreamInfo info = airPlay.rtspGetMediaStreamInfo(
-                        new ByteBufInputStream(request.content()));
-                Log.i(TAG, "TEARDOWN: " + (info != null ? info.getStreamType() : "all"));
-                // A null body means the whole session goes away, otherwise only one stream does
-                if (info == null || info.getStreamType() == MediaStreamInfo.StreamType.VIDEO) {
-                    VideoHolder.notifySessionEnded();
-                }
+                info = airPlay.rtspGetMediaStreamInfo(new ByteBufInputStream(request.content()));
             } catch (Exception e) {
-                Log.w(TAG, "Error in teardown", e);
+                Log.w(TAG, "Could not read the teardown body, treating it as a full teardown", e);
+            }
+            Log.i(TAG, "TEARDOWN: " + (info != null ? info.getStreamType() : "all"));
+            // A body naming one stream tears down only that one; an empty one ends the session
+            if (info == null || info.getStreamType() == MediaStreamInfo.StreamType.VIDEO) {
+                endVideo();
+            }
+            if (info == null || info.getStreamType() == MediaStreamInfo.StreamType.AUDIO) {
+                endAudio();
             }
         }
 
         private DefaultFullHttpResponse createResponse(FullHttpRequest request) {
+            return createResponse(request, RtspResponseStatuses.OK);
+        }
+
+        private DefaultFullHttpResponse createResponse(FullHttpRequest request,
+                                                       HttpResponseStatus status) {
             DefaultFullHttpResponse response = new DefaultFullHttpResponse(
-                    RtspVersions.RTSP_1_0, RtspResponseStatuses.OK);
+                    RtspVersions.RTSP_1_0, status);
             response.headers().clear();
             String cSeq = request.headers().get("CSeq");
             if (cSeq != null) {

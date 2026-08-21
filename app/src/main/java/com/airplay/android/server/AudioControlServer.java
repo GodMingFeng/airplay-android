@@ -32,6 +32,8 @@ public class AudioControlServer implements Runnable {
     private DatagramSocket socket;
     private int port;
     private int syncCount;
+    /** Set by {@link #stop()} so the loop can tell a shutdown apart from a real failure. */
+    private volatile boolean stopping;
 
     public AudioControlServer(Object monitor) {
         this.monitor = monitor;
@@ -49,7 +51,7 @@ public class AudioControlServer implements Runnable {
             }
 
             byte[] buf = new byte[1024];
-            while (!Thread.currentThread().isInterrupted()) {
+            while (!stopping) {
                 DatagramPacket packet = new DatagramPacket(buf, buf.length);
                 socket.receive(packet);
 
@@ -65,12 +67,19 @@ public class AudioControlServer implements Runnable {
                 }
             }
         } catch (Exception e) {
-            if (!Thread.currentThread().isInterrupted()) {
+            if (!stopping) {
                 Log.e(TAG, "Audio control server error", e);
             }
         } finally {
             if (socket != null) socket.close();
+            Log.i(TAG, "Audio control server stopped");
         }
+    }
+
+    /** Ends the session by closing the socket the loop is blocked reading from. */
+    public void stop() {
+        stopping = true;
+        if (socket != null) socket.close();
     }
 
     /**
@@ -92,7 +101,7 @@ public class AudioControlServer implements Runnable {
     }
 
     /** Converts an NTP timestamp onto the same origin the mirroring headers use. */
-    private static long ntpToMicros(long ntp) {
+    static long ntpToMicros(long ntp) {
         long seconds = ((ntp >>> 32) & 0xFFFFFFFFL) - SECONDS_1900_TO_1970;
         long fraction = ntp & 0xFFFFFFFFL;
         return seconds * 1_000_000L + fraction * 1_000_000L / 0x1_0000_0000L;
