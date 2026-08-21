@@ -5,6 +5,19 @@
     android:layout_height="match_parent"
     android:background="#000000">
 
+    <!--
+      The wall the mirrored picture hangs on. Below the SurfaceView, which clears its own
+      rectangle out of the window so the video shows through it, so this is what fills the space
+      around the picture instead of black.
+    -->
+    <ImageView
+        android:id="@+id/wall"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:scaleType="centerCrop"
+        android:src="@drawable/bg_startup"
+        android:contentDescription="@null" />
+
     <SurfaceView
         android:id="@+id/surface_view"
         android:layout_width="match_parent"
@@ -12,10 +25,22 @@
         android:layout_gravity="center" />
 
     <!--
-      Idle wallpaper. It sits above the SurfaceView on purpose: a SurfaceView renders behind the
-      window and punches a transparent hole to show through, which would erase anything drawn
-      underneath it. Covering it instead works, and MainActivity hides this once frames arrive.
-      centerCrop scales the photo up until it fills the screen, keeping its aspect ratio.
+      Moulding round the picture. MainActivity sizes it to the letterboxed video plus the width of
+      the frame on each side; the middle of the drawable is transparent, so the video is untouched.
+    -->
+    <View
+        android:id="@+id/mirror_frame"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:background="@drawable/mirror_frame"
+        android:visibility="gone" />
+
+    <!--
+      Idle wallpaper, the same picture as the wall above. It sits over the SurfaceView on purpose:
+      the surface keeps the last frame of the session that just ended, and covering it is what
+      hides that. MainActivity takes it away once frames arrive, which uncovers the surface and
+      leaves the copy underneath showing round the edges.
     -->
     <ImageView
         android:id="@+id/background"

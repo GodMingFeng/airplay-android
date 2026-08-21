@@ -36,6 +36,8 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     private SurfaceView surfaceView;
     /** Wallpaper shown while nothing is being mirrored, covering the surface underneath. */
     private ImageView background;
+    /** Moulding drawn round the mirrored picture, sized to it whenever the geometry changes. */
+    private View mirrorFrame;
     private LinearLayout controls;
     private Button btnToggle;
     private TextView statusText;
@@ -45,6 +47,8 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     private boolean userStopped = false;
     private int videoWidth;
     private int videoHeight;
+    /** Width of one side of the moulding, in pixels. */
+    private int frameWidthPx;
 
     private final Runnable hideControls = new Runnable() {
         @Override
@@ -65,10 +69,13 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         root = findViewById(R.id.root);
         surfaceView = findViewById(R.id.surface_view);
         background = findViewById(R.id.background);
+        mirrorFrame = findViewById(R.id.mirror_frame);
         controls = findViewById(R.id.controls);
         btnToggle = findViewById(R.id.btn_toggle);
         statusText = findViewById(R.id.status_text);
         ipText = findViewById(R.id.ip_text);
+
+        frameWidthPx = getResources().getDimensionPixelSize(R.dimen.mirror_frame_width);
 
         surfaceView.getHolder().addCallback(this);
 
@@ -81,6 +88,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
                 videoWidth = 0;
                 videoHeight = 0;
                 background.setVisibility(View.VISIBLE);
+                mirrorFrame.setVisibility(View.GONE);
                 controls.removeCallbacks(hideControls);
                 controls.setVisibility(View.VISIBLE);
                 statusText.setText(serverRunning ? getString(R.string.status_running)
@@ -159,14 +167,19 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
 
     /**
      * Sizes the surface so the decoded picture keeps its own aspect ratio inside the
-     * window (letterbox). Without this the codec stretches every frame to the full
-     * screen, so any resolution change on the sender shows up as a distorted image.
+     * window (letterbox), and hangs the frame round it. Without this the codec stretches
+     * every frame to the full screen, so any resolution change on the sender shows up as a
+     * distorted image.
+     *
+     * <p>The picture is given the window less the width of the moulding, so the frame ends up
+     * flush with the top and bottom of the screen and the wallpaper shows down the sides of it.
      */
     private void applyVideoAspectRatio() {
         if (videoWidth <= 0 || videoHeight <= 0) return;
 
-        int containerWidth = root.getWidth();
-        int containerHeight = root.getHeight();
+        int inset = 2 * frameWidthPx;
+        int containerWidth = root.getWidth() - inset;
+        int containerHeight = root.getHeight() - inset;
         if (containerWidth <= 0 || containerHeight <= 0) return;
 
         float videoAspect = (float) videoWidth / videoHeight;
@@ -183,12 +196,24 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         }
 
         FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) surfaceView.getLayoutParams();
-        if (params.width == width && params.height == height) return;
+        if (params.width != width || params.height != height) {
+            params.width = width;
+            params.height = height;
+            surfaceView.setLayoutParams(params);
+            Log.i(TAG, "Video " + videoWidth + "x" + videoHeight + " letterboxed to "
+                    + width + "x" + height);
+        }
 
-        params.width = width;
-        params.height = height;
-        surfaceView.setLayoutParams(params);
-        Log.i(TAG, "Video " + videoWidth + "x" + videoHeight + " letterboxed to " + width + "x" + height);
+        FrameLayout.LayoutParams frameParams =
+                (FrameLayout.LayoutParams) mirrorFrame.getLayoutParams();
+        int frameWidth = width + 2 * frameWidthPx;
+        int frameHeight = height + 2 * frameWidthPx;
+        if (frameParams.width != frameWidth || frameParams.height != frameHeight) {
+            frameParams.width = frameWidth;
+            frameParams.height = frameHeight;
+            mirrorFrame.setLayoutParams(frameParams);
+        }
+        mirrorFrame.setVisibility(View.VISIBLE);
     }
 
     /** Brings the overlay back, then hides it again after a while. */
@@ -259,6 +284,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         statusText.setText(R.string.status_idle);
         controls.setVisibility(View.VISIBLE);
         background.setVisibility(View.VISIBLE);
+        mirrorFrame.setVisibility(View.GONE);
     }
 
     @Override

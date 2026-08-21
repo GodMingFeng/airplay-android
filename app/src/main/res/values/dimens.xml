@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!--
+      Width of the moulding in @drawable/mirror_frame, and so how much room the mirrored picture
+      has to leave for it on each side. It is the sum of the rings in that drawable; change one
+      and the other has to follow. Nothing is left outside it: the frame is meant to reach the
+      top and bottom of the screen, with the wallpaper showing only down the sides.
+    -->
+    <dimen name="mirror_frame_width">12dp</dimen>
+
+</resources>

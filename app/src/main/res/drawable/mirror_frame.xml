@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Picture frame drawn round the mirrored image.
+
+  Every layer is a stroke rather than a fill, because the middle of this drawable sits over the
+  video surface and has to stay transparent. Each ring is inset by the total width of the rings
+  outside it; a shape keeps its stroke within the bounds it is given, so they meet without
+  overlapping. The rings add up to @dimen/mirror_frame_width, which is what MainActivity leaves
+  around the picture, so keep the two in step.
+-->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Outer lip: the dark edge that lifts the moulding off the wallpaper behind it -->
+    <item>
+        <shape android:shape="rectangle">
+            <stroke android:width="2dp" android:color="#26170B" />
+            <corners android:radius="6dp" />
+        </shape>
+    </item>
+
+    <!-- Lit face of the moulding -->
+    <item android:left="2dp" android:top="2dp" android:right="2dp" android:bottom="2dp">
+        <shape android:shape="rectangle">
+            <stroke android:width="4dp" android:color="#E0BE86" />
+            <corners android:radius="5dp" />
+        </shape>
+    </item>
+
+    <!-- Its shaded half, which is what makes the moulding read as rounded -->
+    <item android:left="6dp" android:top="6dp" android:right="6dp" android:bottom="6dp">
+        <shape android:shape="rectangle">
+            <stroke android:width="4dp" android:color="#A87F45" />
+            <corners android:radius="3dp" />
+        </shape>
+    </item>
+
+    <!-- Inner rebate: the shadow where the moulding meets the picture -->
+    <item android:left="10dp" android:top="10dp" android:right="10dp" android:bottom="10dp">
+        <shape android:shape="rectangle">
+            <stroke android:width="2dp" android:color="#4A3418" />
+        </shape>
+    </item>
+
+</layer-list>
