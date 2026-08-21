@@ -24,6 +24,14 @@ public class AirPlay {
     }
 
     /**
+     * Builds the shared Ed25519 identity keypair up front. Call it once at startup, off the
+     * connection path, so the first sender does not wait ~0.5s for it mid-handshake.
+     */
+    public static void prewarmCrypto() {
+        Pairing.prewarm();
+    }
+
+    /**
      * {@code /info}
      * <p>
      * Writes server info to output stream

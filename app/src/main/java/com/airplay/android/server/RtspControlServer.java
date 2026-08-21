@@ -301,19 +301,16 @@ public class RtspControlServer {
                     Log.i(TAG, "Setting up VIDEO stream, connectionID: " + videoInfo.getStreamConnectionID());
                     callback.onVideoFormat(1920, 1080);
 
-                    // Start mirroring receiver
+                    // Start mirroring receiver. The socket is bound now, on this thread, so the
+                    // port is already accepting by the time the reply goes back and the sender's
+                    // connection is not refused; the thread it runs on then only accepts and drains.
                     MirroringReceiver receiver = new MirroringReceiver(airPlayPort, airPlay, callback);
+                    receiver.open();
                     synchronized (sessionLock) {
                         mirroringReceiver = receiver;
                     }
                     Thread mirroringThread = new Thread(receiver);
                     mirroringThread.start();
-
-                    // Wait for server socket to bind
-                    long sleepStart = SystemClock.elapsedRealtime();
-                    Thread.sleep(50);
-                    Log.i(PERF, "VIDEO SETUP fixed sleep(50) actually waited "
-                            + (SystemClock.elapsedRealtime() - sleepStart) + "ms");
 
                     airPlay.rtspSetupVideo(new ByteBufOutputStream(response.content()),
                             airPlayPort, airTunesPort, 7011);

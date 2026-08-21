@@ -10,6 +10,7 @@ import com.github.serezhka.jap2lib.AirPlay;
 import java.io.BufferedInputStream;
 import java.io.DataInputStream;
 import java.io.EOFException;
+import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -35,6 +36,8 @@ public class MirroringReceiver implements Runnable {
     private Socket client;
     /** Set by {@link #stop()} so the loop can tell a shutdown apart from a real failure. */
     private volatile boolean stopping;
+    /** When {@link #open()} bound the socket, the zero point for the first-frame timings. */
+    private long openedAtMs;
 
     public MirroringReceiver(int port, AirPlay airPlay, VideoCallbackInterface callback) {
         this.port = port;
@@ -42,22 +45,32 @@ public class MirroringReceiver implements Runnable {
         this.callback = callback;
     }
 
+    /**
+     * Binds the listening socket on the caller's thread, before {@link #run()} starts. The sender
+     * opens the mirroring connection the instant it has the SETUP reply, so the port has to be
+     * accepting by then or the connection is refused; binding here rather than on the receiver
+     * thread removes that race without the old fixed sleep, and a port clash surfaces to the caller
+     * instead of being lost on the receiver thread.
+     */
+    public void open() throws IOException {
+        openedAtMs = SystemClock.elapsedRealtime();
+        ServerSocket socket = new ServerSocket();
+        socket.setReuseAddress(true);
+        // Has to be set before bind so that accepted sockets inherit the scaled window
+        socket.setReceiveBufferSize(SOCKET_RECEIVE_BUFFER);
+        socket.bind(new InetSocketAddress(port));
+        serverSocket = socket;
+        Log.i(TAG, "Mirroring receiver listening on port " + port);
+        Log.i(PERF, "Mirroring socket bound on port " + port + " in "
+                + (SystemClock.elapsedRealtime() - openedAtMs) + "ms");
+    }
+
     @Override
     public void run() {
         // This thread does nothing but drain the socket and decrypt; if it loses the CPU the
         // sender's window fills up and the picture stutters, so it runs above the default
         Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY);
-        long threadStart = SystemClock.elapsedRealtime();
         try {
-            serverSocket = new ServerSocket();
-            serverSocket.setReuseAddress(true);
-            // Has to be set before bind so that accepted sockets inherit the scaled window
-            serverSocket.setReceiveBufferSize(SOCKET_RECEIVE_BUFFER);
-            serverSocket.bind(new InetSocketAddress(port));
-            Log.i(TAG, "Mirroring receiver listening on port " + port);
-            Log.i(PERF, "Mirroring socket bound on port " + port + " in "
-                    + (SystemClock.elapsedRealtime() - threadStart) + "ms");
-
             long acceptStart = SystemClock.elapsedRealtime();
             Socket accepted = serverSocket.accept();
             accepted.setTcpNoDelay(true);
@@ -101,8 +114,8 @@ public class MirroringReceiver implements Runnable {
                         if (firstVideo) {
                             firstVideo = false;
                             Log.i(PERF, "First video frame decoded "
-                                    + (SystemClock.elapsedRealtime() - threadStart)
-                                    + "ms after the mirroring thread started");
+                                    + (SystemClock.elapsedRealtime() - openedAtMs)
+                                    + "ms after the socket opened");
                         }
                     } catch (Exception e) {
                         Log.e(TAG, "Error video, size: " + payload.length, e);
@@ -114,8 +127,8 @@ public class MirroringReceiver implements Runnable {
                     if (firstSpsPps) {
                         firstSpsPps = false;
                         Log.i(PERF, "First SPS/PPS received "
-                                + (SystemClock.elapsedRealtime() - threadStart)
-                                + "ms after the mirroring thread started");
+                                + (SystemClock.elapsedRealtime() - openedAtMs)
+                                + "ms after the socket opened");
                     }
                 } else {
                     // Ignore other payload types (including type=5 which is plist metadata, not audio)

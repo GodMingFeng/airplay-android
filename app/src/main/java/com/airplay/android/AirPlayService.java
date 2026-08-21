@@ -16,6 +16,7 @@ import android.text.TextUtils;
 import android.util.Log;
 
 import com.airplay.android.server.AirPlayServer;
+import com.github.serezhka.jap2lib.AirPlay;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -124,6 +125,12 @@ public class AirPlayService extends Service {
             return;
         }
         try {
+            // Build the Ed25519 identity keypair off to one side while mDNS comes up and the
+            // sender is still finding us, so the ~0.5s it costs the first time is not spent
+            // mid-handshake. The generator is shared and guarded, so a connection arriving before
+            // this finishes simply waits on the same one-time build rather than starting a second.
+            new Thread(AirPlay::prewarmCrypto, "airplay-crypto-prewarm").start();
+
             AirPlayServer server = new AirPlayServer(serverName, deviceId, 7000, 5000, new VideoCallback());
             server.start();
             sServer = server;

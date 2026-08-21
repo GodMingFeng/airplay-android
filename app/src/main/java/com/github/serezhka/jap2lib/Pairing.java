@@ -32,6 +32,15 @@ class Pairing {
 
     private static final Logger log = LoggerFactory.getLogger(Pairing.class);
 
+    /**
+     * The server's Ed25519 identity keypair. It is a long-lived identity rather than per-session
+     * state, so it is generated once for the whole process and shared by every connection. The
+     * first generation is expensive (~0.5s: class loading plus the curve's precompute tables), so
+     * paying it once keeps it off every handshake. The reference implementation likewise holds a
+     * single server keypair.
+     */
+    private static volatile KeyPair serverKeyPair;
+
     private final KeyPair keyPair;
 
     private byte[] edTheirs;
@@ -42,7 +51,26 @@ class Pairing {
     private boolean pairVerified;
 
     Pairing() {
-        this.keyPair = new KeyPairGenerator().generateKeyPair();
+        this.keyPair = serverKeyPair();
+    }
+
+    private static KeyPair serverKeyPair() {
+        KeyPair local = serverKeyPair;
+        if (local == null) {
+            synchronized (Pairing.class) {
+                local = serverKeyPair;
+                if (local == null) {
+                    local = new KeyPairGenerator().generateKeyPair();
+                    serverKeyPair = local;
+                }
+            }
+        }
+        return local;
+    }
+
+    /** Builds the identity keypair ahead of time so the cost is not paid mid-handshake. */
+    static void prewarm() {
+        serverKeyPair();
     }
 
     void info(OutputStream out) throws Exception {
