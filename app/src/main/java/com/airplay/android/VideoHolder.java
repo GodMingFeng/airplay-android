@@ -111,14 +111,26 @@ public class VideoHolder {
      * Reports that the sender has torn the mirroring session down, so the UI can go back to its
      * idle state. The decoder is deliberately left alone: it is reconfigured from the next
      * session's SPS/PPS anyway, and tearing it down here would race with the receiving threads.
+     *
+     * <p>Whether a session is running is asked of the announced size rather than the decoder's,
+     * because the two come apart precisely when the decoder is reused. A second session at the
+     * same resolution keeps the codec it already has, so nothing reports an output format and the
+     * decoder's geometry stays at zero; a guard reading that would decide there was nothing to end
+     * and leave the last frame of the session on screen for good. Both are cleared, so that the
+     * next session's announcement is seen as new however closely it resembles this one.
      */
     public static void notifySessionEnded() {
         AvSync.reset();
         synchronized (LOCK) {
-            if (sVideoWidth == 0 && sVideoHeight == 0) return;
+            if (sHeaderWidth == 0 && sHeaderHeight == 0 && sVideoWidth == 0 && sVideoHeight == 0) {
+                return;
+            }
+            sHeaderWidth = 0;
+            sHeaderHeight = 0;
             sVideoWidth = 0;
             sVideoHeight = 0;
         }
+        Log.i(TAG, "Session ended, back to the idle screen");
         notifyVideoSize(0, 0);
     }
 
@@ -166,6 +178,10 @@ public class VideoHolder {
                 sCodecThread = null;
                 sCodecHandler = null;
                 sSurface = null;
+                // Cleared alongside the decoder's own geometry, so that whatever the next sender
+                // announces counts as a change even if it happens to match what this one used
+                sHeaderWidth = 0;
+                sHeaderHeight = 0;
                 sVideoWidth = 0;
                 sVideoHeight = 0;
                 resetDecodeStateLocked();
