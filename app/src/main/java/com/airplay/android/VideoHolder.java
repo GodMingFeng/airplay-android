@@ -63,6 +63,12 @@ public class VideoHolder {
     /** Set from the codec error callback; the receiving thread rebuilds on the next frame. */
     private static boolean sNeedsRestart;
     private static AudioPlayer sAudioPlayer;
+    /**
+     * Linear gain the sender's volume slider last asked for, guarded by {@link #AUDIO_LOCK}. Kept
+     * here rather than in the player because the track is built lazily on the first packet and
+     * again for every session, while the volume can be set at any point either side of that.
+     */
+    private static float sAudioGain = 1f;
 
     /** Access units waiting for a codec input buffer, oldest first. */
     private static final ArrayDeque<Frame> sPending = new ArrayDeque<>();
@@ -146,6 +152,23 @@ public class VideoHolder {
     }
 
     /**
+     * Applies the volume the sender asked for, and remembers it for the track that is built for
+     * the next session.
+     *
+     * @param gain 0 for silence, 1 for the samples as they arrive
+     */
+    public static void setAudioVolume(float gain) {
+        AudioPlayer player;
+        synchronized (AUDIO_LOCK) {
+            sAudioGain = gain;
+            player = sAudioPlayer;
+        }
+        if (player != null) {
+            player.setVolume(gain);
+        }
+    }
+
+    /**
      * Lets go of the audio track at the end of a session.
      *
      * <p>Not merely tidiness. The track keeps around a tenth of a second of samples it accepted but
@@ -160,6 +183,9 @@ public class VideoHolder {
         synchronized (AUDIO_LOCK) {
             player = sAudioPlayer;
             sAudioPlayer = null;
+            // Back to full scale as well: the next sender states its volume when it connects,
+            // but one that never does must not inherit a slider left at the bottom by the last
+            sAudioGain = 1f;
         }
         if (player != null) {
             player.release();
@@ -504,6 +530,7 @@ public class VideoHolder {
         synchronized (AUDIO_LOCK) {
             if (sAudioPlayer == null) {
                 sAudioPlayer = new AudioPlayer();
+                sAudioPlayer.setVolume(sAudioGain);
             }
             player = sAudioPlayer;
         }

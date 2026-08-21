@@ -134,6 +134,27 @@ public class AudioPlayer {
     }
 
     /**
+     * Sets the playback gain, which is how the sender's volume slider reaches the speakers.
+     *
+     * <p>Applied to the track rather than to the samples: the track scales in the mixer, so the
+     * decoded PCM is left alone and the audio clock published from it stays exactly as it was.
+     * A track carries no gain over from the one before it, so the caller has to reapply this to
+     * every track a session builds.
+     *
+     * @param gain 0 for silence, 1 for the samples as they arrive
+     */
+    public synchronized void setVolume(float gain) {
+        AudioTrack track = audioTrack;
+        if (track == null) return;
+        try {
+            track.setVolume(gain);
+            Log.i(TAG, "Volume set to " + gain);
+        } catch (Exception e) {
+            Log.w(TAG, "Could not set the volume to " + gain, e);
+        }
+    }
+
+    /**
      * Writes one decoded packet. Synchronised against {@link #release}, which now happens at the end
      * of every session rather than only when the app goes away: without it a teardown could pull the
      * track out from under a write. The monitor is uncontended in the ordinary case, one packet every

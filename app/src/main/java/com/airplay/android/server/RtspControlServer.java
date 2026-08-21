@@ -15,6 +15,7 @@ import java.io.ByteArrayOutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
+import java.util.Locale;
 import java.util.Map;
 
 import io.netty.bootstrap.ServerBootstrap;
@@ -46,6 +47,11 @@ public class RtspControlServer {
     /** Shared tag for the connection-timing trace; grep with `adb logcat -s AirPlayPerf`. */
     private static final String PERF = "AirPlayPerf";
 
+    /** Volume the sender sends for the mute at the very bottom of its slider. */
+    private static final float MUTE_DB = -144f;
+    /** Quietest step the slider reaches before it mutes. */
+    private static final float MIN_DB = -30f;
+
     private final int airPlayPort;
     private final int airTunesPort;
     private final VideoCallbackInterface callback;
@@ -64,6 +70,12 @@ public class RtspControlServer {
     private MirroringReceiver mirroringReceiver;
     private AudioReceiver audioReceiver;
     private AudioControlServer audioControlServer;
+    /**
+     * Where the sender's volume slider stands, in the decibels of attenuation AirPlay states it
+     * in: 0 is the samples untouched, {@link #MIN_DB} the quietest step and {@link #MUTE_DB} mute.
+     * Held so GET_PARAMETER can answer with the value actually in force.
+     */
+    private volatile float volumeDb;
 
     public RtspControlServer(int airPlayPort, int airTunesPort, VideoCallbackInterface callback) {
         this.airPlayPort = airPlayPort;
@@ -141,7 +153,20 @@ public class RtspControlServer {
         Log.i(TAG, "Ending the audio session");
         if (audio != null) audio.stop();
         if (control != null) control.stop();
+        // In step with the gain the holder drops, so a fresh session starts at full scale
+        volumeDb = 0f;
         VideoHolder.releaseAudio();
+    }
+
+    /**
+     * Turns AirPlay's attenuation in decibels into the linear gain an AudioTrack takes. Anything
+     * below the step the slider bottoms out at, short of the mute itself, is pulled back up to
+     * that step, so a stray reading cannot silence the stream outright.
+     */
+    static float gainForDb(float db) {
+        if (db <= MUTE_DB) return 0f;
+        if (db >= 0f) return 1f;
+        return (float) Math.pow(10.0, Math.max(db, MIN_DB) / 20.0);
     }
 
     private class RtspHandler extends ChannelInboundHandlerAdapter {
@@ -257,9 +282,12 @@ public class RtspControlServer {
                 return sendResponse(ctx, request, response);
             } else if ("GET_PARAMETER".equals(method)) {
                 DefaultFullHttpResponse response = createResponse(request);
-                response.content().writeBytes("volume: 1.000000\r\n".getBytes(StandardCharsets.US_ASCII));
+                response.headers().add("Content-Type", "text/parameters");
+                String body = String.format(Locale.US, "volume: %f\r\n", volumeDb);
+                response.content().writeBytes(body.getBytes(StandardCharsets.US_ASCII));
                 return sendResponse(ctx, request, response);
             } else if ("SET_PARAMETER".equals(method)) {
+                handleSetParameter(request);
                 DefaultFullHttpResponse response = createResponse(request);
                 return sendResponse(ctx, request, response);
             } else if ("FLUSH".equals(method)) {
@@ -371,6 +399,39 @@ public class RtspControlServer {
                 }
             }
             return false;
+        }
+
+        /**
+         * Reads the parameters the sender pushes mid-session. Only the volume is acted on: the
+         * rest (artwork, track names, playback progress) belong to audio-only streaming and have
+         * nowhere to go here.
+         *
+         * <p>The body is the plain RTSP form, one {@code name: value} to a line, and is only read
+         * when the sender says that is what it sent; artwork arrives on the same method as a JPEG.
+         */
+        private void handleSetParameter(FullHttpRequest request) {
+            String contentType = request.headers().get("Content-Type");
+            if (contentType != null
+                    && !contentType.toLowerCase(Locale.US).startsWith("text/parameters")) {
+                Log.d(TAG, "Ignoring SET_PARAMETER of type " + contentType);
+                return;
+            }
+            String body = request.content().toString(StandardCharsets.US_ASCII);
+            for (String line : body.split("\r\n|\n")) {
+                int colon = line.indexOf(':');
+                if (colon < 0 || !"volume".equalsIgnoreCase(line.substring(0, colon).trim())) {
+                    continue;
+                }
+                try {
+                    float db = Float.parseFloat(line.substring(colon + 1).trim());
+                    volumeDb = db;
+                    float gain = gainForDb(db);
+                    Log.i(TAG, "Sender set the volume to " + db + "dB, gain " + gain);
+                    VideoHolder.setAudioVolume(gain);
+                } catch (NumberFormatException e) {
+                    Log.w(TAG, "Could not read the volume out of '" + line + "'");
+                }
+            }
         }
 
         private void handleTeardown(FullHttpRequest request) {
